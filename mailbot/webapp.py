@@ -1,0 +1,906 @@
+"""Local HireLens Mail web app: compose UI plus unsubscribe pages."""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import mimetypes
+import re
+import threading
+import time
+import traceback
+from collections import deque
+from collections.abc import Callable
+from datetime import datetime, timezone
+from html import escape
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+from mailbot.config import ConfigError, Settings, load_settings, project_root, settings_with_overrides
+from mailbot.hiring_templates import (
+    SUBJECT as HIRING_SUBJECT,
+    get_template,
+    list_templates,
+    pick_random_template,
+    write_template_files,
+)
+from mailbot.message import build_compose_message, resolve_body_format
+from mailbot.smtp_client import AuthFailed, MailerError, RecipientRejected, SmtpMailer, TemporaryFailure
+from mailbot.store import Store, normalize_email, normalize_header, valid_email
+
+
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,200}$")
+RECIPIENT_RE = re.compile(r"^(?:([^<>]*?)\s*)?(?:<([^>]+)>|([^\s,;]+))$")
+MAX_BODY = 2_000_000
+MAX_IDLE_SECONDS = 3600
+LOG_LIMIT = 200
+_LOG_LOCK = threading.Lock()
+_LOG_LINES: deque[str] = deque(maxlen=LOG_LIMIT)
+
+
+def append_log(message: str) -> None:
+    stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    line = f"[{stamp}] {message}"
+    with _LOG_LOCK:
+        _LOG_LINES.append(line)
+    print(line)
+
+
+def recent_logs(limit: int = 80) -> list[str]:
+    with _LOG_LOCK:
+        lines = list(_LOG_LINES)
+    return lines[-max(1, min(limit, LOG_LIMIT)) :]
+
+
+class AppError(Exception):
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
+
+
+def default_idle_seconds(settings: Settings) -> int:
+    """Suggested pause from the hourly mailbox cap."""
+    return max(0, min(MAX_IDLE_SECONDS, int(3600 / settings.hourly_limit)))
+
+
+def parse_idle_seconds(value: object, *, fallback: int = 0) -> int:
+    if value is None or value == "":
+        return fallback
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise AppError("Idle time must be a number of seconds.") from exc
+    if seconds < 0:
+        raise AppError("Idle time cannot be negative.")
+    if seconds > MAX_IDLE_SECONDS:
+        raise AppError(f"Idle time cannot be more than {MAX_IDLE_SECONDS} seconds.")
+    return int(seconds)
+
+
+def format_recipient_line(email: str, name: str = "") -> str:
+    address = normalize_email(email)
+    display = (name or "").strip()
+    if display:
+        return f"{display} <{address}>"
+    return address
+
+
+def merge_recipients(
+    existing: list[tuple[str, str]],
+    incoming: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    merged: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for address, name in existing + incoming:
+        key = normalize_email(address)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append((key, name.strip()))
+    return merged
+
+
+def parse_recipients(raw: str) -> list[tuple[str, str]]:
+    people: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for chunk in re.split(r"[\n,;]+", raw or ""):
+        piece = chunk.strip()
+        if not piece:
+            continue
+        match = RECIPIENT_RE.match(piece)
+        if match is None:
+            raise AppError(f"Could not parse recipient: {piece}")
+        name = (match.group(1) or "").strip().strip('"')
+        address = normalize_email(match.group(2) or match.group(3) or "")
+        if not valid_email(address):
+            raise AppError(f"{piece} is not a valid email address.")
+        if address in seen:
+            continue
+        seen.add(address)
+        people.append((address, name))
+    if not people:
+        raise AppError("Add at least one recipient in the To field.")
+    if len(people) > 50:
+        raise AppError("Private Email allows at most 50 recipients in one send. Split the list.")
+    return people
+
+
+def _split_address(value: str) -> tuple[str, str]:
+    """Accept bare emails or `Name <email@domain>` values."""
+    piece = (value or "").strip()
+    match = RECIPIENT_RE.match(piece)
+    if match is None:
+        return normalize_email(piece), ""
+    name = (match.group(1) or "").strip().strip('"')
+    address = normalize_email(match.group(2) or match.group(3) or "")
+    return address, name
+
+
+def _recipient_from_mapping(row: dict) -> tuple[str, str] | None:
+    mapped = {normalize_header(str(key)): str(value or "").strip() for key, value in row.items() if key is not None}
+    email = mapped.get("email", "")
+    if not email:
+        for key in ("mail", "address", "recipient"):
+            if mapped.get(key):
+                email = mapped[key]
+                break
+    if not email:
+        return None
+    address, embedded_name = _split_address(email)
+    name = mapped.get("name") or mapped.get("full_name") or embedded_name
+    if not name:
+        first = mapped.get("first_name", "")
+        last = mapped.get("last_name", "")
+        name = f"{first} {last}".strip()
+    if not valid_email(address):
+        raise AppError(f"{email} is not a valid email address.")
+    return address, name
+
+
+def parse_recipients_csv(content: str) -> list[tuple[str, str]]:
+    text = content.lstrip("\ufeff").strip()
+    if not text:
+        raise AppError("CSV file is empty.")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise AppError("CSV needs a header row with an email column.")
+    headers = {normalize_header(name) for name in reader.fieldnames if name}
+    if not headers.intersection({"email", "mail", "address", "recipient", "e_mail", "email_address"}):
+        # Allow a single-column CSV with no useful header by falling back below.
+        if len(reader.fieldnames) == 1:
+            return parse_recipients_lines(text)
+        raise AppError("CSV needs an email column (email, mail, address, or recipient).")
+
+    people: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    invalid: list[str] = []
+    for index, row in enumerate(reader, start=2):
+        try:
+            parsed = _recipient_from_mapping(row)
+        except AppError as exc:
+            invalid.append(f"line {index}: {exc}")
+            continue
+        if parsed is None:
+            continue
+        address, name = parsed
+        if address in seen:
+            continue
+        seen.add(address)
+        people.append((address, name))
+    if invalid and not people:
+        raise AppError(invalid[0])
+    if not people:
+        raise AppError("No email addresses found in the CSV.")
+    if len(people) > 50:
+        raise AppError("Private Email allows at most 50 recipients in one send. Split the list.")
+    return people
+
+
+def parse_recipients_lines(content: str) -> list[tuple[str, str]]:
+    """Parse a simple one-address-per-line file, with or without a header."""
+    lines = [line.strip() for line in content.replace("\r\n", "\n").split("\n")]
+    lines = [line for line in lines if line]
+    if not lines:
+        raise AppError("File is empty.")
+    if normalize_header(lines[0]) in {"email", "mail", "address", "recipient", "e_mail", "email_address"}:
+        lines = lines[1:]
+    return parse_recipients("\n".join(lines))
+
+
+def parse_recipients_json(content: str) -> list[tuple[str, str]]:
+    text = content.strip()
+    if not text:
+        raise AppError("JSON file is empty.")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AppError(f"Invalid JSON: {exc.msg}") from exc
+
+    rows: list[object]
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        for key in ("recipients", "emails", "contacts", "people", "to", "addresses"):
+            if key in data and isinstance(data[key], list):
+                rows = data[key]
+                break
+        else:
+            if "email" in data:
+                rows = [data]
+            else:
+                raise AppError(
+                    "JSON must be an array, or an object with recipients/emails/contacts."
+                )
+    else:
+        raise AppError("JSON must be an array or object.")
+
+    people: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(rows, start=1):
+        if isinstance(item, str):
+            address = normalize_email(item)
+            if not valid_email(address):
+                raise AppError(f"Item {index}: {item} is not a valid email address.")
+            parsed = (address, "")
+        elif isinstance(item, dict):
+            parsed = _recipient_from_mapping(item)
+            if parsed is None:
+                raise AppError(f"Item {index}: missing email.")
+        else:
+            raise AppError(f"Item {index}: expected a string or object.")
+        address, name = parsed
+        if address in seen:
+            continue
+        seen.add(address)
+        people.append((address, name))
+    if not people:
+        raise AppError("No email addresses found in the JSON.")
+    if len(people) > 50:
+        raise AppError("Private Email allows at most 50 recipients in one send. Split the list.")
+    return people
+
+
+def parse_recipient_upload(filename: str, content: str) -> dict:
+    name = (filename or "upload").lower()
+    if name.endswith(".json"):
+        people = parse_recipients_json(content)
+        source = "json"
+    elif name.endswith(".csv") or name.endswith(".txt"):
+        if name.endswith(".txt"):
+            people = parse_recipients_lines(content)
+        else:
+            try:
+                people = parse_recipients_csv(content)
+            except AppError:
+                # Some CSVs are really just email lists without a usable header.
+                people = parse_recipients_lines(content)
+        source = "csv" if name.endswith(".csv") else "txt"
+    else:
+        stripped = content.lstrip()
+        if stripped.startswith("[") or stripped.startswith("{"):
+            people = parse_recipients_json(content)
+            source = "json"
+        else:
+            people = parse_recipients_csv(content)
+            source = "csv"
+
+    lines = [format_recipient_line(email, display) for email, display in people]
+    return {
+        "ok": True,
+        "source": source,
+        "count": len(people),
+        "recipients": [{"email": email, "name": display} for email, display in people],
+        "to_text": "\n".join(lines),
+        "message": f"Loaded {len(people)} address(es) from {source.upper()}.",
+    }
+
+
+def parse_body_format(value: object) -> str:
+    fmt = str(value or "auto").strip().lower()
+    if fmt not in {"plain", "html", "auto"}:
+        raise AppError("Content format must be plain, html, or auto.")
+    return fmt
+
+
+def parse_bool(value: object, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    raise AppError("Random style must be true or false.")
+
+
+def send_compose(
+    settings: Settings,
+    *,
+    recipients: list[tuple[str, str]],
+    subject: str,
+    body: str,
+    body_format: str = "plain",
+    random_style: bool = False,
+    idle_seconds: int = 0,
+    sleep: Callable[[float], None] = time.sleep,
+    log: Callable[[str], None] | None = None,
+    on_progress: Callable[[dict], None] | None = None,
+    rng=None,
+) -> dict:
+    subject = subject.strip()
+    body = body.strip()
+    random_style = parse_bool(random_style)
+    requested_format = parse_body_format(body_format)
+    if random_style:
+        body_format = "html"
+        if not subject:
+            subject = HIRING_SUBJECT
+    else:
+        body_format = resolve_body_format(body, requested_format)
+    if not subject:
+        raise AppError("Subject is required.")
+    if not random_style and not body:
+        raise AppError("Email content is required.")
+    idle_seconds = parse_idle_seconds(idle_seconds)
+
+    report = {
+        "ok": True,
+        "planned": len(recipients),
+        "sent": 0,
+        "failed": 0,
+        "errors": [],
+        "idle_seconds": idle_seconds,
+        "body_format": body_format,
+        "random_style": random_style,
+        "styles_used": [],
+    }
+
+    def emit(event: dict) -> None:
+        if on_progress is not None:
+            on_progress(event)
+        if log is not None and event.get("message"):
+            log(str(event["message"]))
+
+    if random_style:
+        format_note = "Random HTML style: each recipient gets a different hiring template."
+    else:
+        format_note = (
+            f"Using {body_format} content."
+            if requested_format == body_format
+            else f"Content looks like HTML; sending as HTML (was {requested_format})."
+        )
+    emit(
+        {
+            "type": "start",
+            "planned": report["planned"],
+            "idle_seconds": idle_seconds,
+            "body_format": body_format,
+            "random_style": random_style,
+            "done": 0,
+            "sent": 0,
+            "failed": 0,
+            "message": f"Starting send to {report['planned']} recipient(s). {format_note}",
+        }
+    )
+    with SmtpMailer(settings) as mailer:
+        for index, (address, name) in enumerate(recipients):
+            position = index + 1
+            if index > 0 and idle_seconds > 0:
+                emit(
+                    {
+                        "type": "waiting",
+                        "index": position,
+                        "email": address,
+                        "idle_seconds": idle_seconds,
+                        "done": report["sent"] + report["failed"],
+                        "sent": report["sent"],
+                        "failed": report["failed"],
+                        "planned": report["planned"],
+                        "message": f"Waiting {idle_seconds}s before {address}.",
+                    }
+                )
+                sleep(idle_seconds)
+            style_id = ""
+            style_name = ""
+            send_body = body
+            send_format = body_format
+            if random_style:
+                picked = pick_random_template(apply_url=settings.apply_url, rng=rng)
+                style_id = picked["id"]
+                style_name = picked["name"]
+                send_body = picked["html"]
+                send_format = "html"
+                report["styles_used"].append({"email": address, "id": style_id, "name": style_name})
+            emit(
+                {
+                    "type": "sending",
+                    "index": position,
+                    "email": address,
+                    "style_id": style_id,
+                    "style_name": style_name,
+                    "done": report["sent"] + report["failed"],
+                    "sent": report["sent"],
+                    "failed": report["failed"],
+                    "planned": report["planned"],
+                    "message": (
+                        f"Sending {position}/{report['planned']} to {address}"
+                        + (f" ({style_name})." if style_name else ".")
+                    ),
+                }
+            )
+            message = build_compose_message(
+                settings,
+                to_email=address,
+                to_name=name,
+                subject=subject,
+                body=send_body,
+                body_format=send_format,
+            )
+            try:
+                mailer.send(message, address)
+            except RecipientRejected as exc:
+                report["failed"] += 1
+                report["errors"].append(f"{address}: {exc}")
+                emit(
+                    {
+                        "type": "failed",
+                        "index": position,
+                        "email": address,
+                        "error": str(exc),
+                        "done": report["sent"] + report["failed"],
+                        "sent": report["sent"],
+                        "failed": report["failed"],
+                        "planned": report["planned"],
+                        "message": f"Failed {address}: {exc}",
+                    }
+                )
+                continue
+            except TemporaryFailure as exc:
+                report["failed"] += 1
+                report["errors"].append(f"{address}: {exc}")
+                report["ok"] = False
+                report["error"] = f"Stopped after a temporary mail error: {exc}"
+                emit(
+                    {
+                        "type": "failed",
+                        "index": position,
+                        "email": address,
+                        "error": str(exc),
+                        "done": report["sent"] + report["failed"],
+                        "sent": report["sent"],
+                        "failed": report["failed"],
+                        "planned": report["planned"],
+                        "message": report["error"],
+                    }
+                )
+                emit({"type": "done", **report, "message": report["error"]})
+                return report
+            except AuthFailed as exc:
+                raise AppError(str(exc), status=401) from exc
+            except MailerError as exc:
+                raise AppError(str(exc), status=502) from exc
+            report["sent"] += 1
+            emit(
+                {
+                    "type": "sent",
+                    "index": position,
+                    "email": address,
+                    "done": report["sent"] + report["failed"],
+                    "sent": report["sent"],
+                    "failed": report["failed"],
+                    "planned": report["planned"],
+                    "message": f"Sent {position}/{report['planned']} to {address}.",
+                }
+            )
+    if report["failed"] and report["sent"] == 0:
+        report["ok"] = False
+        report["error"] = report["errors"][0] if report["errors"] else "Send failed."
+    summary = f"Sent {report['sent']} of {report['planned']}."
+    if report["failed"]:
+        summary += f" Failed {report['failed']}."
+    emit({"type": "done", **report, "message": summary})
+    return report
+
+
+def test_login(settings: Settings) -> dict:
+    if not valid_email(settings.smtp_username):
+        raise AppError(f"{settings.smtp_username} is not a valid email address.")
+    try:
+        with SmtpMailer(settings):
+            return {"ok": True, "message": f"Login ok for {settings.smtp_username}."}
+    except AuthFailed as exc:
+        raise AppError(str(exc), status=401) from exc
+    except MailerError as exc:
+        raise AppError(str(exc), status=502) from exc
+
+
+def make_handler(settings: Settings, web_root: Path):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            try:
+                path = urlparse(self.path).path
+                if path in {"/", "/index.html"}:
+                    self._file(web_root / "index.html", "text/html; charset=utf-8")
+                    return
+                if path == "/health":
+                    self._json(200, {"ok": True})
+                    return
+                if path == "/api/logs":
+                    self._json(200, {"ok": True, "lines": recent_logs()})
+                    return
+                if path == "/api/defaults":
+                    self._json(
+                        200,
+                        {
+                            "email": settings.smtp_username,
+                            "from_name": settings.from_name,
+                            "physical_address": settings.physical_address,
+                            "password_saved": bool(settings.smtp_password),
+                            "smtp_host": settings.smtp_host,
+                            "idle_seconds": default_idle_seconds(settings),
+                            "hourly_limit": settings.hourly_limit,
+                        },
+                    )
+                    return
+                if path == "/api/templates":
+                    write_template_files()
+                    self._json(200, {"ok": True, "templates": list_templates()})
+                    return
+                if path.startswith("/api/templates/"):
+                    template_id = unquote(path[len("/api/templates/") :]).strip("/")
+                    if not template_id or "/" in template_id or ".." in template_id:
+                        self._json(404, {"ok": False, "error": "Template not found."})
+                        return
+                    template = get_template(template_id)
+                    if template is None:
+                        self._json(404, {"ok": False, "error": f"Template not found: {template_id}"})
+                        return
+                    self._json(200, {"ok": True, **template})
+                    return
+                if path.startswith("/static/"):
+                    self._static(path[len("/static/") :])
+                    return
+                token = _token(path)
+                if token is not None:
+                    self._unsubscribe_get(token)
+                    return
+                self._json(404, {"ok": False, "error": "Not found."})
+            except Exception as exc:  # noqa: BLE001
+                self._handle_exception(exc)
+
+        def do_POST(self) -> None:
+            path = urlparse(self.path).path
+            token = _token(path)
+            if token is not None:
+                try:
+                    self._unsubscribe_post(token)
+                except Exception as exc:  # noqa: BLE001
+                    self._handle_exception(exc)
+                return
+            streaming = False
+            try:
+                payload = self._read_json()
+                if path == "/api/test-login":
+                    append_log(f"POST /api/test-login for {payload.get('email', '')}")
+                    live = settings_with_overrides(
+                        settings,
+                        email=str(payload.get("email", "")),
+                        password=str(payload.get("password", "")),
+                        from_name=str(payload.get("from_name", "")),
+                    )
+                    result = test_login(live)
+                    append_log(result.get("message", "Login ok."))
+                    self._json(200, {**result, "logs": recent_logs(40)})
+                    return
+                if path == "/api/parse-list":
+                    filename = str(payload.get("filename", "upload.csv"))
+                    content = str(payload.get("content", ""))
+                    append_log(f"POST /api/parse-list ({filename})")
+                    result = parse_recipient_upload(filename, content)
+                    append_log(result["message"])
+                    self._json(200, {**result, "logs": recent_logs(40)})
+                    return
+                if path == "/api/send":
+                    live = settings_with_overrides(
+                        settings,
+                        email=str(payload.get("email", "")),
+                        password=str(payload.get("password", "")),
+                        from_name=str(payload.get("from_name", "")),
+                        physical_address=str(payload.get("physical_address", "")),
+                    )
+                    recipients = parse_recipients(str(payload.get("to", "")))
+                    idle = parse_idle_seconds(
+                        payload.get("idle_seconds"),
+                        fallback=default_idle_seconds(live),
+                    )
+                    body_format = parse_body_format(payload.get("body_format", "plain"))
+                    random_style = parse_bool(payload.get("random_style", False))
+                    append_log(
+                        f"POST /api/send to {len(recipients)} recipient(s), "
+                        f"format={body_format}, random_style={random_style}, idle={idle}s"
+                    )
+                    streaming = True
+                    self._stream_send(
+                        live,
+                        recipients=recipients,
+                        subject=str(payload.get("subject", "")),
+                        body=str(payload.get("body", "")),
+                        body_format=body_format,
+                        random_style=random_style,
+                        idle_seconds=idle,
+                    )
+                    return
+                self._json(404, {"ok": False, "error": "Not found.", "logs": recent_logs(40)})
+            except AppError as exc:
+                append_log(f"ERROR {path}: {exc}")
+                if streaming:
+                    return
+                self._json(
+                    exc.status,
+                    {"ok": False, "error": str(exc), "logs": recent_logs(40)},
+                )
+            except ConfigError as exc:
+                append_log(f"ERROR {path}: {exc}")
+                if streaming:
+                    return
+                self._json(400, {"ok": False, "error": str(exc), "logs": recent_logs(40)})
+            except json.JSONDecodeError as exc:
+                append_log(f"ERROR {path}: invalid JSON ({exc})")
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "Request body must be JSON.",
+                        "detail": str(exc),
+                        "logs": recent_logs(40),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                if streaming:
+                    append_log(f"ERROR {path}: {exc}")
+                    return
+                self._handle_exception(exc)
+
+        def _stream_send(
+            self,
+            live: Settings,
+            *,
+            recipients: list[tuple[str, str]],
+            subject: str,
+            body: str,
+            body_format: str,
+            random_style: bool = False,
+            idle_seconds: int,
+        ) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def write_event(event: dict) -> None:
+                if event.get("message"):
+                    append_log(str(event["message"]))
+                if event.get("type") == "error" and event.get("error"):
+                    append_log(f"ERROR {event['error']}")
+                payload = dict(event)
+                if event.get("type") in {"done", "error"}:
+                    payload["logs"] = recent_logs(60)
+                line = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+                self.wfile.write(line)
+                self.wfile.flush()
+
+            try:
+                send_compose(
+                    live,
+                    recipients=recipients,
+                    subject=subject,
+                    body=body,
+                    body_format=body_format,
+                    random_style=random_style,
+                    idle_seconds=idle_seconds,
+                    on_progress=write_event,
+                )
+            except AppError as exc:
+                append_log(f"ERROR send: {exc}")
+                write_event(
+                    {
+                        "type": "error",
+                        "ok": False,
+                        "error": str(exc),
+                        "message": str(exc),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - surface unexpected SMTP failures to the UI
+                detail = f"{exc}\n{traceback.format_exc()}"
+                append_log(f"ERROR send: {exc}")
+                write_event(
+                    {
+                        "type": "error",
+                        "ok": False,
+                        "error": str(exc),
+                        "detail": detail,
+                        "message": str(exc),
+                    }
+                )
+
+        def _handle_exception(self, exc: Exception) -> None:
+            detail = traceback.format_exc()
+            append_log(f"ERROR {exc}")
+            append_log(detail.strip().splitlines()[-1] if detail.strip() else str(exc))
+            try:
+                self._json(
+                    500,
+                    {
+                        "ok": False,
+                        "error": str(exc) or exc.__class__.__name__,
+                        "detail": detail,
+                        "logs": recent_logs(60),
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        def log_message(self, fmt: str, *args) -> None:
+            message = fmt % args
+            message = re.sub(r"/u/[A-Za-z0-9_-]+", "/u/[redacted]", message)
+            append_log(f"{self.address_string()} {message}")
+
+        def _read_json(self) -> dict:
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError as exc:
+                raise AppError("Invalid Content-Length.") from exc
+            if length <= 0:
+                return {}
+            if length > MAX_BODY:
+                raise AppError("Request is too large.")
+            raw = self.rfile.read(length)
+            data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise AppError("JSON body must be an object.")
+            return data
+
+        def _static(self, relative: str) -> None:
+            relative = unquote(relative).replace("\\", "/")
+            if not relative or ".." in relative.split("/"):
+                self._send(404, "Not found.", "text/plain; charset=utf-8")
+                return
+            path = (web_root / "static" / relative).resolve()
+            root = (web_root / "static").resolve()
+            if root not in path.parents and path != root:
+                self._send(404, "Not found.", "text/plain; charset=utf-8")
+                return
+            if not path.is_file():
+                self._send(404, "Not found.", "text/plain; charset=utf-8")
+                return
+            content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+            if content_type.startswith("text/") or content_type in {
+                "application/javascript",
+                "application/json",
+            }:
+                content_type = f"{content_type}; charset=utf-8"
+            self._bytes(200, path.read_bytes(), content_type)
+
+        def _file(self, path: Path, content_type: str) -> None:
+            if not path.is_file():
+                self._send(404, "Not found.", "text/plain; charset=utf-8")
+                return
+            self._bytes(200, path.read_bytes(), content_type)
+
+        def _unsubscribe_get(self, token: str) -> None:
+            person = _lookup(settings.database_path, token)
+            if person is None:
+                self._send(404, "This unsubscribe link is not valid.", "text/plain; charset=utf-8")
+                return
+            already = person.status == "unsubscribed"
+            self._send(
+                200,
+                _unsubscribe_page(person.email, settings.from_name, token, already=already, done=False),
+                "text/html; charset=utf-8",
+            )
+
+        def _unsubscribe_post(self, token: str) -> None:
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                length = 0
+            if length > 0:
+                self.rfile.read(min(length, 1_000_000))
+            with Store(settings.database_path) as store:
+                person = store.unsubscribe(token=token)
+            if person is None:
+                self._send(404, "This unsubscribe link is not valid.", "text/plain; charset=utf-8")
+                return
+            self._send(
+                200,
+                _unsubscribe_page(person.email, settings.from_name, token, already=False, done=True),
+                "text/html; charset=utf-8",
+            )
+
+        def _json(self, status: int, payload: dict) -> None:
+            data = json.dumps(payload).encode("utf-8")
+            self._bytes(status, data, "application/json; charset=utf-8")
+
+        def _send(self, status: int, body: str, content_type: str) -> None:
+            self._bytes(status, body.encode("utf-8"), content_type)
+
+        def _bytes(self, status: int, data: bytes, content_type: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+    return Handler
+
+
+def serve(host: str = "127.0.0.1", port: int = 8080, root: Path | None = None) -> None:
+    root = root or project_root()
+    settings = load_settings(root)
+    with Store(settings.database_path):
+        pass
+    web_root = root / "web"
+    if not (web_root / "index.html").is_file():
+        raise ConfigError(f"Missing web UI at {web_root / 'index.html'}")
+    written = write_template_files(root)
+    append_log(f"Hiring templates ready: {len(written) - 1} HTML files.")
+    server = ThreadingHTTPServer((host, port), make_handler(settings, web_root))
+    append_log(f"HireLens Mail at http://{host}:{port}")
+    append_log("Open that URL, enter email, password, and content, then send.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        server.server_close()
+
+
+def _lookup(database: Path, token: str):
+    with Store(database) as store:
+        return store.get_by_token(token)
+
+
+def _token(path: str) -> str | None:
+    prefix = "/u/"
+    if not path.startswith(prefix):
+        return None
+    token = path[len(prefix) :]
+    if TOKEN_RE.fullmatch(token) is None:
+        return None
+    return token
+
+
+def _unsubscribe_page(email: str, from_name: str, token: str, *, already: bool, done: bool) -> str:
+    safe_email = escape(email)
+    safe_name = escape(from_name)
+    safe_token = escape(token)
+    if done or already:
+        lead = f"{safe_email} is unsubscribed from {safe_name} and will not get another campaign."
+        button = ""
+    else:
+        lead = f"Remove {safe_email} from {safe_name} emails?"
+        button = (
+            f'<form method="post" action="/u/{safe_token}">'
+            '<button type="submit">Unsubscribe</button>'
+            "</form>"
+        )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Unsubscribe</title>
+</head>
+<body style="font-family:Georgia,serif;margin:40px;color:#102a36;">
+  <h1>Unsubscribe</h1>
+  <p>{lead}</p>
+  {button}
+</body>
+</html>
+"""

@@ -1,0 +1,7 @@
+Hi {{first_name}},
+
+Replace this paragraph with the campaign you actually want to send.
+
+{{physical_address}}
+
+Unsubscribe: {{unsubscribe_url}}

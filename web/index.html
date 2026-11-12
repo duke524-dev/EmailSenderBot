@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HireLens Mail</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+  <main class="shell">
+    <header class="brand">
+      <p class="brand-mark">HireLens</p>
+      <h1>Mail</h1>
+      <p class="lede">Send from your Private Email mailbox. Enter the address, password, and message here.</p>
+    </header>
+
+    <form id="compose" class="compose" novalidate>
+      <section class="panel" aria-labelledby="mailbox-heading">
+        <div class="panel-head">
+          <h2 id="mailbox-heading">Mailbox</h2>
+          <p>Logs in to mail.privateemail.com for this send only. The password is not saved.</p>
+        </div>
+        <div class="fields">
+          <label class="field">
+            <span>Email address</span>
+            <input id="email" name="email" type="email" autocomplete="username" required placeholder="davidyang@hirelens.us">
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input id="password" name="password" type="password" autocomplete="current-password" required placeholder="Mailbox or app password">
+          </label>
+          <label class="field">
+            <span>From name</span>
+            <input id="from_name" name="from_name" type="text" autocomplete="organization" placeholder="HireLens">
+          </label>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="message-heading">
+        <div class="panel-head">
+          <h2 id="message-heading">Message</h2>
+          <p>One address per line in the To field. Subject and body are typed below.</p>
+        </div>
+        <div class="fields">
+          <div class="field field-wide to-field">
+            <div class="to-head">
+              <span>To</span>
+              <label class="upload-button">
+                Upload CSV / JSON
+                <input id="list-file" type="file" accept=".csv,.json,.txt,text/csv,application/json,text/plain" hidden>
+              </label>
+            </div>
+            <textarea id="to" name="to" rows="4" required placeholder="person@example.com&#10;Name &lt;another@example.com&gt;"></textarea>
+            <p class="hint">Type addresses, or upload a CSV/JSON list. CSV needs an <code>email</code> column; JSON can be an array of addresses or objects.</p>
+            <p id="upload-status" class="hint upload-status" hidden></p>
+          </div>
+          <label class="field field-wide">
+            <span>Subject</span>
+            <input id="subject" name="subject" type="text" required placeholder="Subject line">
+          </label>
+          <fieldset class="field field-wide format-field">
+            <legend>Email content</legend>
+            <div class="content-toolbar">
+              <div class="format-toggle" role="radiogroup" aria-label="Content format">
+                <label class="format-option">
+                  <input type="radio" name="body_format" value="auto" checked>
+                  <span>Auto</span>
+                </label>
+                <label class="format-option">
+                  <input type="radio" name="body_format" value="html">
+                  <span>HTML</span>
+                </label>
+                <label class="format-option">
+                  <input type="radio" name="body_format" value="plain">
+                  <span>Plain text</span>
+                </label>
+              </div>
+              <div class="content-actions">
+                <label class="format-option random-switch" title="Each recipient gets a random hiring HTML style">
+                  <input type="checkbox" id="random_style" name="random_style">
+                  <span>Random style</span>
+                </label>
+                <button type="button" id="load-template" class="upload-button">Load template</button>
+              </div>
+            </div>
+            <textarea id="body" name="body" rows="12" required placeholder="Write the email here."></textarea>
+            <p id="body-hint" class="hint">Click <strong>Load template</strong> to choose a built-in HireLens HTML email. Turn on <strong>Random style</strong> to send a different template to each bulk recipient.</p>
+          </fieldset>
+          <label class="field">
+            <span>Idle time <em>(seconds between emails)</em></span>
+            <input id="idle_seconds" name="idle_seconds" type="number" min="0" max="3600" step="1" value="5" required>
+          </label>
+          <label class="field">
+            <span>Postal address <em>(optional)</em></span>
+            <input id="physical_address" name="physical_address" type="text" placeholder="Street, City, State ZIP">
+          </label>
+        </div>
+      </section>
+
+      <div class="actions">
+        <button type="button" id="test-login" class="ghost">Test login</button>
+        <button type="submit" id="send" class="primary">Send email</button>
+      </div>
+
+      <div id="progress" class="progress" hidden>
+        <div class="progress-meta">
+          <span id="progress-label">Ready</span>
+          <span id="progress-count">0 / 0</span>
+        </div>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-labelledby="progress-label">
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+      </div>
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+
+      <section class="log-panel" aria-labelledby="log-heading">
+        <div class="log-head">
+          <h2 id="log-heading">Activity log</h2>
+          <button type="button" id="refresh-logs" class="ghost tiny">Refresh</button>
+        </div>
+        <pre id="log-view" class="log-view">Waiting for activity…</pre>
+      </section>
+    </form>
+  </main>
+
+  <div id="template-modal" class="modal" hidden>
+    <div class="modal-backdrop" data-close-modal></div>
+    <div class="modal-dialog modal-dialog-wide" role="dialog" aria-modal="true" aria-labelledby="template-modal-title">
+      <div class="modal-head">
+        <div>
+          <h2 id="template-modal-title">Choose a template</h2>
+          <p>Preview a built-in HireLens hiring email, then load it into the content box.</p>
+        </div>
+        <button type="button" id="close-template-modal" class="ghost tiny" data-close-modal>Close</button>
+      </div>
+      <div class="modal-body">
+        <div id="template-grid" class="template-grid"></div>
+        <div class="template-preview-pane">
+          <div class="preview-meta">
+            <div>
+              <p id="preview-title" class="preview-title">Preview</p>
+              <p id="preview-blurb" class="preview-blurb">Select a template to preview it here.</p>
+            </div>
+            <button type="button" id="use-template" class="primary tiny" disabled>Use template</button>
+          </div>
+          <iframe id="template-preview" class="template-preview" title="Template preview" sandbox=""></iframe>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=random1"></script>
+</body>
+</html>
