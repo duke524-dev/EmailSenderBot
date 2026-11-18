@@ -445,8 +445,8 @@ class WebComposeTests(EnvMixin):
             text_path = Path(folder) / "templates" / "hiring" / "hiring.txt"
             self.assertTrue(text_path.is_file())
             plain_file = text_path.read_text(encoding="utf-8")
-            self.assertIn("Apply Now:", plain_file)
-            self.assertIn("https://forms.gle/d5ifR5Htk7jwRxmC9", plain_file)
+            self.assertIn("I came across your profile", plain_file)
+            self.assertIn("50% of the earnings", plain_file)
             self.assertNotIn("<h1", plain_file)
         sample = get_template("horizon")
         assert sample is not None
@@ -458,9 +458,9 @@ class WebComposeTests(EnvMixin):
         self.assertIn("/static/hirelens-logo.png", sample["html"])
         self.assertIn('alt="HireLens"', sample["html"])
         self.assertNotIn("&lt;h1", sample["html"])
-        self.assertIn("Account Executive Manager", sample["text"])
-        self.assertIn("Position Details", sample["text"])
-        self.assertIn("Apply Now: https://forms.gle/d5ifR5Htk7jwRxmC9", sample["text"])
+        self.assertIn("I came across your profile", sample["text"])
+        self.assertIn("secure additional accounts", sample["text"])
+        self.assertIn("50% of the earnings", sample["text"])
         self.assertNotIn("<", sample["text"])
 
     def test_upload_csv_and_json_recipient_lists(self) -> None:

@@ -307,51 +307,19 @@ def _responsibilities(theme: dict[str, str]) -> str:
     )
 
 
+PLAIN_TEXT_BODY = """Hello,
+I hope you’re doing well.
+I came across your profile and found it quite impressive. As you may be aware, there has been a sharp increase in demand for tasks related to AI training. However, most platforms impose various restrictions.
+Since these platforms typically allow only one account per user, our engineers are facing difficulties in carrying out their work.
+For this reason, we are looking to secure additional accounts. If you would be willing to assist us, we would be happy to offer you 50% of the earnings generated from those accounts as compensation.
+Please feel free to reach out if you are interested.
+"""
+
+
 def render_plain_template(*, apply_url: str | None = None) -> str:
-    """Build the shared plain-text hiring email. Themes only change HTML styling."""
-    cta_url = resolve_apply_url(apply_url)
-    details = "\n".join(f"- {label}: {value}" for label, value in COPY["details"])
-    responsibilities = "\n".join(f"- {item}" for item in COPY["responsibilities"])
-    return (
-        f"{COPY['eyebrow']}\n"
-        f"{COPY['title']}\n"
-        f"{SUBJECT}\n"
-        "\n"
-        f"{COPY['lede']}\n"
-        "\n"
-        f"{COPY['intro']}\n"
-        "\n"
-        "Part-Time · 10 hrs/week · Flexible\n"
-        "\n"
-        f"{COPY['details_heading']}\n"
-        f"{details}\n"
-        "\n"
-        f"{COPY['team_heading']}\n"
-        f"{COPY['team_p1']}\n"
-        "\n"
-        f"{COPY['team_p2']}\n"
-        "\n"
-        f"{COPY['responsibilities_heading']}\n"
-        f"{responsibilities}\n"
-        "\n"
-        f"{COPY['values']}\n"
-        "\n"
-        f"{COPY['who_heading']}\n"
-        f"{COPY['who_p1']}\n"
-        "\n"
-        f"{COPY['who_p2']}\n"
-        "\n"
-        f"{COPY['apply_heading']}\n"
-        f"{COPY['apply_p1']}\n"
-        "\n"
-        f"{COPY['apply_p2']}\n"
-        "\n"
-        f"{COPY['closing']}\n"
-        "\n"
-        f"{COPY['cta']}: {cta_url}\n"
-        "\n"
-        f"{COPY['footer']}\n"
-    )
+    """Build the shared plain-text email body."""
+    _ = apply_url  # Kept so existing call sites can still pass apply_url.
+    return PLAIN_TEXT_BODY
 
 
 def render_template(
