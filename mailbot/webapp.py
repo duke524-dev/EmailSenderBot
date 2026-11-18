@@ -588,6 +588,10 @@ def make_handler(settings: Settings, web_root: Path):
         def do_GET(self) -> None:
             try:
                 path = urlparse(self.path).path
+                # Cursor/Chrome DevTools probes this; it is not part of the mail UI.
+                if path in {"/json/version", "/json/list"}:
+                    self._send(404, "", "text/plain; charset=utf-8")
+                    return
                 if path in {"/", "/index.html"}:
                     self._file(web_root / "index.html", "text/html; charset=utf-8")
                     return
@@ -831,6 +835,23 @@ def make_handler(settings: Settings, web_root: Path):
 
         def log_message(self, fmt: str, *args) -> None:
             message = fmt % args
+            # Skip browser noise: DevTools probes and repeated page/asset loads.
+            if any(
+                marker in message
+                for marker in (
+                    "/json/version",
+                    "/json/list",
+                    '"GET / HTTP/',
+                    '"GET /index.html HTTP/',
+                    '"GET /static/',
+                    '"GET /favicon.ico HTTP/',
+                    '"GET /health HTTP/',
+                    '"GET /api/logs HTTP/',
+                    '"GET /api/defaults HTTP/',
+                    '"GET /api/templates HTTP/',
+                )
+            ):
+                return
             message = re.sub(r"/u/[A-Za-z0-9_-]+", "/u/[redacted]", message)
             append_log(f"{self.address_string()} {message}")
 
