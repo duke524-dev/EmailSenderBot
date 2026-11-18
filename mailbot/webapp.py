@@ -7,6 +7,8 @@ import io
 import json
 import mimetypes
 import re
+import select
+import socket
 import threading
 import time
 import traceback
@@ -79,6 +81,43 @@ def parse_idle_seconds(value: object, *, fallback: int = 0) -> int:
     return int(seconds)
 
 
+def peer_closed(sock: socket.socket | None) -> bool:
+    """True when the browser closed the HTTP connection (Stop / tab close)."""
+    if sock is None:
+        return True
+    try:
+        readable, _, exceptional = select.select([sock], [], [sock], 0)
+        if exceptional:
+            return True
+        if not readable:
+            return False
+        data = sock.recv(1, socket.MSG_PEEK)
+        return data == b""
+    except OSError:
+        return True
+
+
+def wait_idle(
+    seconds: float,
+    sleep: Callable[[float], None],
+    should_stop: Callable[[], bool] | None = None,
+) -> bool:
+    """Sleep for idle pacing. Returns True if stop was requested during the wait."""
+    if seconds <= 0:
+        return bool(should_stop and should_stop())
+    if should_stop is None:
+        sleep(seconds)
+        return False
+    remaining = float(seconds)
+    while remaining > 0:
+        if should_stop():
+            return True
+        step = min(0.25, remaining)
+        sleep(step)
+        remaining -= step
+    return should_stop()
+
+
 def format_recipient_line(email: str, name: str = "") -> str:
     address = normalize_email(email)
     display = (name or "").strip()
@@ -122,8 +161,6 @@ def parse_recipients(raw: str) -> list[tuple[str, str]]:
         people.append((address, name))
     if not people:
         raise AppError("Add at least one recipient in the To field.")
-    if len(people) > 50:
-        raise AppError("Private Email allows at most 50 recipients in one send. Split the list.")
     return people
 
 
@@ -193,8 +230,6 @@ def parse_recipients_csv(content: str) -> list[tuple[str, str]]:
         raise AppError(invalid[0])
     if not people:
         raise AppError("No email addresses found in the CSV.")
-    if len(people) > 50:
-        raise AppError("Private Email allows at most 50 recipients in one send. Split the list.")
     return people
 
 
@@ -257,8 +292,6 @@ def parse_recipients_json(content: str) -> list[tuple[str, str]]:
         people.append((address, name))
     if not people:
         raise AppError("No email addresses found in the JSON.")
-    if len(people) > 50:
-        raise AppError("Private Email allows at most 50 recipients in one send. Split the list.")
     return people
 
 
@@ -329,6 +362,7 @@ def send_compose(
     sleep: Callable[[float], None] = time.sleep,
     log: Callable[[str], None] | None = None,
     on_progress: Callable[[dict], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
     rng=None,
 ) -> dict:
     subject = subject.strip()
@@ -357,6 +391,7 @@ def send_compose(
         "body_format": body_format,
         "random_style": random_style,
         "styles_used": [],
+        "stopped": False,
     }
 
     def emit(event: dict) -> None:
@@ -364,6 +399,23 @@ def send_compose(
             on_progress(event)
         if log is not None and event.get("message"):
             log(str(event["message"]))
+
+    def stop_requested() -> bool:
+        return bool(should_stop and should_stop())
+
+    def finish_stopped(reason: str) -> dict:
+        report["stopped"] = True
+        report["ok"] = True
+        report["error"] = reason
+        emit(
+            {
+                "type": "done",
+                **report,
+                "done": report["sent"] + report["failed"],
+                "message": reason,
+            }
+        )
+        return report
 
     if random_style:
         format_note = "Random HTML style: each recipient gets a different hiring template."
@@ -386,9 +438,15 @@ def send_compose(
             "message": f"Starting send to {report['planned']} recipient(s). {format_note}",
         }
     )
+    if stop_requested():
+        return finish_stopped("Stopped before any email was sent.")
     with SmtpMailer(settings) as mailer:
         for index, (address, name) in enumerate(recipients):
             position = index + 1
+            if stop_requested():
+                return finish_stopped(
+                    f"Stopped. Sent {report['sent']} of {report['planned']}."
+                )
             if index > 0 and idle_seconds > 0:
                 emit(
                     {
@@ -403,7 +461,14 @@ def send_compose(
                         "message": f"Waiting {idle_seconds}s before {address}.",
                     }
                 )
-                sleep(idle_seconds)
+                if wait_idle(idle_seconds, sleep, should_stop):
+                    return finish_stopped(
+                        f"Stopped during idle wait. Sent {report['sent']} of {report['planned']}."
+                    )
+            if stop_requested():
+                return finish_stopped(
+                    f"Stopped. Sent {report['sent']} of {report['planned']}."
+                )
             style_id = ""
             style_name = ""
             send_body = body
@@ -683,17 +748,34 @@ def make_handler(settings: Settings, web_root: Path):
             self.send_header("Connection", "close")
             self.end_headers()
 
+            stopped = threading.Event()
+
+            def should_stop() -> bool:
+                if stopped.is_set():
+                    return True
+                if peer_closed(self.connection):
+                    stopped.set()
+                    return True
+                return False
+
             def write_event(event: dict) -> None:
+                if stopped.is_set() and event.get("type") not in {"done", "error"}:
+                    return
                 if event.get("message"):
                     append_log(str(event["message"]))
                 if event.get("type") == "error" and event.get("error"):
                     append_log(f"ERROR {event['error']}")
+                if event.get("stopped"):
+                    append_log("Send stopped by client.")
                 payload = dict(event)
                 if event.get("type") in {"done", "error"}:
                     payload["logs"] = recent_logs(60)
                 line = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
-                self.wfile.write(line)
-                self.wfile.flush()
+                try:
+                    self.wfile.write(line)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    stopped.set()
 
             try:
                 send_compose(
@@ -705,6 +787,7 @@ def make_handler(settings: Settings, web_root: Path):
                     random_style=random_style,
                     idle_seconds=idle_seconds,
                     on_progress=write_event,
+                    should_stop=should_stop,
                 )
             except AppError as exc:
                 append_log(f"ERROR send: {exc}")
@@ -850,7 +933,9 @@ def serve(host: str = "127.0.0.1", port: int = 8080, root: Path | None = None) -
     if not (web_root / "index.html").is_file():
         raise ConfigError(f"Missing web UI at {web_root / 'index.html'}")
     written = write_template_files(root)
-    append_log(f"Hiring templates ready: {len(written) - 1} HTML files.")
+    html_count = sum(1 for path in written if path.suffix == ".html")
+    text_count = sum(1 for path in written if path.suffix == ".txt")
+    append_log(f"Hiring templates ready: {html_count} HTML + {text_count} plain text.")
     server = ThreadingHTTPServer((host, port), make_handler(settings, web_root))
     append_log(f"HireLens Mail at http://{host}:{port}")
     append_log("Open that URL, enter email, password, and content, then send.")

@@ -1,6 +1,7 @@
 const form = document.getElementById("compose");
 const statusEl = document.getElementById("status");
 const sendBtn = document.getElementById("send");
+const stopBtn = document.getElementById("stop");
 const testBtn = document.getElementById("test-login");
 const progressEl = document.getElementById("progress");
 const progressFill = document.getElementById("progress-fill");
@@ -18,18 +19,24 @@ const templatePreview = document.getElementById("template-preview");
 const previewTitle = document.getElementById("preview-title");
 const previewBlurb = document.getElementById("preview-blurb");
 const useTemplateBtn = document.getElementById("use-template");
+const useTemplateTextBtn = document.getElementById("use-template-text");
+const templateTextPreview = document.getElementById("template-text-preview");
 const subjectInput = document.getElementById("subject");
 const bodyInput = document.getElementById("body");
 const loadTemplateBtn = document.getElementById("load-template");
 
 let idleTimer = null;
+let sendAbort = null;
+let lastSendProgress = { sent: 0, failed: 0, planned: 0 };
 const clientLogs = [];
 let selectedTemplateId = "";
 let selectedTemplateName = "";
 let selectedTemplateHtml = "";
+let selectedTemplateText = "";
 let selectedTemplateSubject = "";
 let templatesCache = [];
 let previewRequestId = 0;
+let previewMode = "html";
 
 function nowStamp() {
   return new Date().toLocaleTimeString();
@@ -269,7 +276,14 @@ async function postJson(url, data) {
   return parsed;
 }
 
-async function postSendStream(data, onEvent) {
+function isAbortError(error) {
+  return (
+    Boolean(error) &&
+    (error.name === "AbortError" || /aborted|abort/i.test(String(error.message || error)))
+  );
+}
+
+async function postSendStream(data, onEvent, signal) {
   pushLog("POST /api/send (stream)");
   let response;
   try {
@@ -280,8 +294,17 @@ async function postSendStream(data, onEvent) {
         Accept: "application/x-ndjson",
       },
       body: JSON.stringify(data),
+      signal,
     });
   } catch (error) {
+    if (isAbortError(error) || (signal && signal.aborted)) {
+      const stopped = new Error(
+        `Stopped. Sent ${lastSendProgress.sent} of ${lastSendProgress.planned || "?"}.`
+      );
+      stopped.name = "AbortError";
+      stopped.stopped = true;
+      throw stopped;
+    }
     pushLog(`Network error on /api/send: ${error.message || error}`);
     await fetchServerLogs();
     throw new Error(`Network error: ${error.message || error}`);
@@ -311,37 +334,57 @@ async function postSendStream(data, onEvent) {
   let buffer = "";
   let finalEvent = null;
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+        let event;
+        try {
+          event = JSON.parse(trimmed);
+        } catch (error) {
+          pushLog(`Bad stream line: ${trimmed.slice(0, 400)}`);
+          throw new Error(`Bad stream line from server: ${error.message}`);
+        }
+        if (event.message) {
+          pushLog(event.message);
+        }
+        if (event.logs) {
+          showServerLogs(event.logs);
+        }
+        onEvent(event);
+        if (event.type === "done" || event.type === "error") {
+          finalEvent = event;
+        }
+      }
     }
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        continue;
+  } catch (error) {
+    if (isAbortError(error) || (signal && signal.aborted)) {
+      if (finalEvent && (finalEvent.type === "done" || finalEvent.stopped)) {
+        return finalEvent;
       }
-      let event;
-      try {
-        event = JSON.parse(trimmed);
-      } catch (error) {
-        pushLog(`Bad stream line: ${trimmed.slice(0, 400)}`);
-        throw new Error(`Bad stream line from server: ${error.message}`);
-      }
-      if (event.message) {
-        pushLog(event.message);
-      }
-      if (event.logs) {
-        showServerLogs(event.logs);
-      }
-      onEvent(event);
-      if (event.type === "done" || event.type === "error") {
-        finalEvent = event;
-      }
+      const stopped = {
+        type: "done",
+        ok: true,
+        stopped: true,
+        sent: lastSendProgress.sent,
+        failed: lastSendProgress.failed,
+        planned: lastSendProgress.planned,
+        message: `Stopped. Sent ${lastSendProgress.sent} of ${lastSendProgress.planned || "?"}.`,
+      };
+      onEvent(stopped);
+      return stopped;
     }
+    throw error;
   }
 
   const leftover = buffer.trim();
@@ -406,14 +449,29 @@ function closeTemplateModal() {
   document.body.style.overflow = "";
 }
 
+function showPreviewMode(mode) {
+  previewMode = mode === "text" ? "text" : "html";
+  const showText = previewMode === "text";
+  templatePreview.hidden = showText;
+  templateTextPreview.hidden = !showText;
+  useTemplateBtn.classList.toggle("primary", !showText);
+  useTemplateBtn.classList.toggle("ghost", showText);
+  useTemplateTextBtn.classList.toggle("primary", showText);
+  useTemplateTextBtn.classList.toggle("ghost", !showText);
+}
+
 function clearPreview() {
   selectedTemplateHtml = "";
+  selectedTemplateText = "";
   selectedTemplateSubject = "";
   useTemplateBtn.disabled = true;
+  useTemplateTextBtn.disabled = true;
   previewTitle.textContent = "Preview";
   previewBlurb.textContent = "Select a template to preview it here.";
   templatePreview.removeAttribute("srcdoc");
   templatePreview.src = "about:blank";
+  templateTextPreview.textContent = "";
+  showPreviewMode("html");
 }
 
 function markPreviewSelection(templateId) {
@@ -454,10 +512,13 @@ async function previewTemplate(templateId, templateName = "", templateBlurb = ""
   selectedTemplateName = templateName || templateId;
   markPreviewSelection(templateId);
   useTemplateBtn.disabled = true;
+  useTemplateTextBtn.disabled = true;
   previewTitle.textContent = selectedTemplateName;
   previewBlurb.textContent = "Loading preview…";
   templatePreview.removeAttribute("srcdoc");
   templatePreview.src = "about:blank";
+  templateTextPreview.textContent = "";
+  showPreviewMode(selectedFormat() === "plain" ? "text" : "html");
   pushLog(`Previewing template: ${templateId}`);
   try {
     const response = await fetch(`/api/templates/${encodeURIComponent(templateId)}`);
@@ -469,16 +530,25 @@ async function previewTemplate(templateId, templateName = "", templateBlurb = ""
       throw new Error((parsed && parsed.error) || formatHttpError(response.status, contentType, bodyText, parsed));
     }
     const html = parsed.html || "";
+    const text = parsed.text || "";
     if (!html) {
       throw new Error("Template returned empty HTML.");
     }
+    if (!text) {
+      throw new Error("Template returned empty plain text.");
+    }
     selectedTemplateHtml = html;
+    selectedTemplateText = text;
     selectedTemplateSubject = parsed.subject || "";
     selectedTemplateName = parsed.name || templateName || templateId;
     previewTitle.textContent = selectedTemplateName;
-    previewBlurb.textContent = templateBlurb || parsed.blurb || "Preview ready.";
+    previewBlurb.textContent =
+      (templateBlurb || parsed.blurb || "Preview ready.") +
+      " Use HTML for styled mail, or plain text for a text-only send.";
     templatePreview.srcdoc = html;
+    templateTextPreview.textContent = text;
     useTemplateBtn.disabled = false;
+    useTemplateTextBtn.disabled = false;
   } catch (error) {
     if (requestId !== previewRequestId) {
       return;
@@ -491,8 +561,10 @@ async function previewTemplate(templateId, templateName = "", templateBlurb = ""
   }
 }
 
-function usePreviewedTemplate() {
-  if (!selectedTemplateHtml) {
+function usePreviewedTemplate(format = "html") {
+  const asPlain = format === "plain" || format === "text";
+  const content = asPlain ? selectedTemplateText : selectedTemplateHtml;
+  if (!content) {
     setStatus("Select a template to preview first.", "is-error");
     return;
   }
@@ -500,13 +572,14 @@ function usePreviewedTemplate() {
   if (selectedTemplateSubject) {
     subjectInput.value = selectedTemplateSubject;
   }
-  contentBox.value = selectedTemplateHtml;
+  contentBox.value = content;
   contentBox.dispatchEvent(new Event("input", { bubbles: true }));
-  setBodyFormat("html");
+  setBodyFormat(asPlain ? "plain" : "html");
   closeTemplateModal();
   contentBox.focus();
   contentBox.scrollIntoView({ behavior: "smooth", block: "center" });
-  const message = `Loaded ${selectedTemplateName} HTML into the Email content box.`;
+  const kind = asPlain ? "plain text" : "HTML";
+  const message = `Loaded ${selectedTemplateName} ${kind} into the Email content box.`;
   setStatus(message, "is-ok");
   pushLog(message);
 }
@@ -575,79 +648,120 @@ testBtn.addEventListener("click", async () => {
   }
 });
 
+function setSendingUi(isSending) {
+  sendBtn.disabled = isSending;
+  testBtn.disabled = isSending;
+  stopBtn.hidden = !isSending;
+  stopBtn.disabled = !isSending;
+}
+
+stopBtn.addEventListener("click", () => {
+  if (!sendAbort) {
+    return;
+  }
+  stopBtn.disabled = true;
+  clearIdleTimer();
+  setStatus("Stopping…");
+  progressLabel.textContent = "Stopping after the current email…";
+  pushLog("Stop requested. Finishing the current email, then ending the run.");
+  sendAbort.abort();
+});
+
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   clearIdleTimer();
+  if (sendAbort) {
+    sendAbort.abort();
+  }
+  sendAbort = new AbortController();
+  lastSendProgress = { sent: 0, failed: 0, planned: 0 };
   setStatus("Sending…");
   showProgress();
   updateProgress({ done: 0, planned: 0, label: "Connecting…", state: "" });
-  sendBtn.disabled = true;
-  testBtn.disabled = true;
+  setSendingUi(true);
   try {
     const data = payload();
     if (Number.isNaN(data.idle_seconds) || data.idle_seconds < 0) {
       throw new Error("Idle time must be 0 or more seconds.");
     }
-    const result = await postSendStream(data, (event) => {
-      if (event.type === "start") {
-        updateProgress({
-          done: 0,
-          planned: event.planned,
-          label: event.message || "Starting…",
-        });
-        return;
-      }
-      if (event.type === "waiting") {
-        updateProgress({
-          done: event.done,
-          planned: event.planned,
-          label: event.message,
-          state: "is-waiting",
-        });
-        startIdleCountdown(event.idle_seconds, event.email);
-        return;
-      }
-      if (event.type === "sending") {
-        clearIdleTimer();
-        updateProgress({
-          done: event.done,
-          planned: event.planned,
-          label: event.message || `Sending to ${event.email}…`,
-        });
-        return;
-      }
-      if (event.type === "sent" || event.type === "failed") {
-        clearIdleTimer();
-        updateProgress({
-          done: event.done,
-          planned: event.planned,
-          label: event.message,
-          state: event.type === "failed" ? "is-error" : "",
-        });
-        return;
-      }
-      if (event.type === "done") {
-        clearIdleTimer();
-        updateProgress({
-          done: event.sent + event.failed,
-          planned: event.planned,
-          label: event.message || "Done",
-          state: event.failed ? "is-error" : "is-done",
-        });
-      }
-      if (event.type === "error") {
-        clearIdleTimer();
-        progressEl.classList.add("is-error");
-        updateProgress({
-          done: event.done || 0,
-          planned: event.planned || 0,
-          label: event.message || event.error || "Error",
-          state: "is-error",
-        });
-      }
-    });
+    const result = await postSendStream(
+      data,
+      (event) => {
+        if (typeof event.sent === "number") {
+          lastSendProgress.sent = event.sent;
+        }
+        if (typeof event.failed === "number") {
+          lastSendProgress.failed = event.failed;
+        }
+        if (typeof event.planned === "number") {
+          lastSendProgress.planned = event.planned;
+        }
+        if (event.type === "start") {
+          updateProgress({
+            done: 0,
+            planned: event.planned,
+            label: event.message || "Starting…",
+          });
+          return;
+        }
+        if (event.type === "waiting") {
+          updateProgress({
+            done: event.done,
+            planned: event.planned,
+            label: event.message,
+            state: "is-waiting",
+          });
+          startIdleCountdown(event.idle_seconds, event.email);
+          return;
+        }
+        if (event.type === "sending") {
+          clearIdleTimer();
+          updateProgress({
+            done: event.done,
+            planned: event.planned,
+            label: event.message || `Sending to ${event.email}…`,
+          });
+          return;
+        }
+        if (event.type === "sent" || event.type === "failed") {
+          clearIdleTimer();
+          updateProgress({
+            done: event.done,
+            planned: event.planned,
+            label: event.message,
+            state: event.type === "failed" ? "is-error" : "",
+          });
+          return;
+        }
+        if (event.type === "done") {
+          clearIdleTimer();
+          updateProgress({
+            done: event.sent + event.failed,
+            planned: event.planned,
+            label: event.message || "Done",
+            state: event.stopped ? "is-done" : event.failed ? "is-error" : "is-done",
+          });
+        }
+        if (event.type === "error") {
+          clearIdleTimer();
+          progressEl.classList.add("is-error");
+          updateProgress({
+            done: event.done || 0,
+            planned: event.planned || 0,
+            label: event.message || event.error || "Error",
+            state: "is-error",
+          });
+        }
+      },
+      sendAbort.signal
+    );
 
-    const lines = [`Sent ${result.sent} of ${result.planned}.`];
+    const lines = [];
+    if (result.stopped) {
+      lines.push(result.message || `Stopped. Sent ${result.sent} of ${result.planned}.`);
+    } else {
+      lines.push(`Sent ${result.sent} of ${result.planned}.`);
+    }
     if (result.random_style) {
       lines.push("Random HTML style was used per recipient.");
     }
@@ -660,15 +774,25 @@ form.addEventListener("submit", async (event) => {
     if (result.errors && result.errors.length) {
       lines.push(...result.errors.slice(0, 8));
     }
-    setStatus(lines.join("\n"), result.failed ? "is-error" : "is-ok");
+    setStatus(lines.join("\n"), result.failed && !result.stopped ? "is-error" : "is-ok");
   } catch (error) {
     clearIdleTimer();
-    progressEl.classList.add("is-error");
-    await fetchServerLogs();
-    setStatus(error.message || String(error), "is-error");
+    if (error && error.stopped) {
+      updateProgress({
+        done: lastSendProgress.sent + lastSendProgress.failed,
+        planned: lastSendProgress.planned,
+        label: error.message,
+        state: "is-done",
+      });
+      setStatus(error.message || "Stopped.", "is-ok");
+    } else {
+      progressEl.classList.add("is-error");
+      await fetchServerLogs();
+      setStatus(error.message || String(error), "is-error");
+    }
   } finally {
-    sendBtn.disabled = false;
-    testBtn.disabled = false;
+    sendAbort = null;
+    setSendingUi(false);
   }
 });
 
@@ -737,7 +861,25 @@ loadTemplateBtn.addEventListener("click", async () => {
 });
 
 useTemplateBtn.addEventListener("click", () => {
-  usePreviewedTemplate();
+  showPreviewMode("html");
+  usePreviewedTemplate("html");
+});
+
+useTemplateTextBtn.addEventListener("click", () => {
+  showPreviewMode("text");
+  usePreviewedTemplate("plain");
+});
+
+useTemplateBtn.addEventListener("mouseenter", () => {
+  if (!useTemplateBtn.disabled) {
+    showPreviewMode("html");
+  }
+});
+
+useTemplateTextBtn.addEventListener("mouseenter", () => {
+  if (!useTemplateTextBtn.disabled) {
+    showPreviewMode("text");
+  }
 });
 
 templateModal.querySelectorAll("[data-close-modal]").forEach((el) => {

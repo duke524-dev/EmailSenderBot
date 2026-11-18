@@ -88,7 +88,7 @@
               </div>
             </div>
             <textarea id="body" name="body" rows="12" required placeholder="Write the email here."></textarea>
-            <p id="body-hint" class="hint">Click <strong>Load template</strong> to choose a built-in HireLens HTML email. Turn on <strong>Random style</strong> to send a different template to each bulk recipient.</p>
+            <p id="body-hint" class="hint">Click <strong>Load template</strong> for a HireLens hiring email in HTML or plain text. Turn on <strong>Random style</strong> to send a different HTML theme to each bulk recipient.</p>
           </fieldset>
           <label class="field">
             <span>Idle time <em>(seconds between emails)</em></span>
@@ -103,6 +103,7 @@
 
       <div class="actions">
         <button type="button" id="test-login" class="ghost">Test login</button>
+        <button type="button" id="stop" class="danger" hidden>Stop</button>
         <button type="submit" id="send" class="primary">Send email</button>
       </div>
 
@@ -133,7 +134,7 @@
       <div class="modal-head">
         <div>
           <h2 id="template-modal-title">Choose a template</h2>
-          <p>Preview a built-in HireLens hiring email, then load it into the content box.</p>
+          <p>Preview a HireLens hiring email, then load the HTML theme or the shared plain-text version.</p>
         </div>
         <button type="button" id="close-template-modal" class="ghost tiny" data-close-modal>Close</button>
       </div>
@@ -145,14 +146,18 @@
               <p id="preview-title" class="preview-title">Preview</p>
               <p id="preview-blurb" class="preview-blurb">Select a template to preview it here.</p>
             </div>
-            <button type="button" id="use-template" class="primary tiny" disabled>Use template</button>
+            <div class="preview-actions">
+              <button type="button" id="use-template-text" class="ghost tiny" disabled>Use plain text</button>
+              <button type="button" id="use-template" class="primary tiny" disabled>Use HTML</button>
+            </div>
           </div>
           <iframe id="template-preview" class="template-preview" title="Template preview" sandbox=""></iframe>
+          <pre id="template-text-preview" class="template-text-preview" hidden></pre>
         </div>
       </div>
     </div>
   </div>
 
-  <script src="/static/app.js?v=random1"></script>
+  <script src="/static/app.js?v=plain1"></script>
 </body>
 </html>

@@ -19,7 +19,8 @@ from mailbot.webapp import serve
 
 EXAMPLES = """
 examples:
-  python -m mailbot init
+  python -m mailbot init --provider ionos
+  python -m mailbot init --provider privateemail
   python -m mailbot doctor
   python -m mailbot contacts add --email ada@example.com --name "Ada Lovelace" --source "website form"
   python -m mailbot contacts import contacts.csv --source "customer export"
@@ -56,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init", help="Create .env and the subscriber database")
+    init.add_argument(
+        "--provider",
+        choices=["ionos", "privateemail"],
+        help="Which .env.example.* file to copy into .env",
+    )
     init.set_defaults(func=cmd_init)
 
     doctor = commands.add_parser("doctor", help="Check DNS records and SMTP login")
@@ -121,17 +127,40 @@ def _add_template_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--text", required=True, help="Plain-text template path")
 
 
-def cmd_init(_args: argparse.Namespace) -> int:
+def cmd_init(args: argparse.Namespace) -> int:
     root = project_root()
     env_path = root / ".env"
-    example = root / ".env.example"
+    provider = getattr(args, "provider", None)
+    if provider:
+        example = root / f".env.example.{provider}"
+    else:
+        example = None
+        for name in (".env.example.privateemail", ".env.example.ionos"):
+            candidate = root / name
+            if candidate.is_file():
+                example = candidate
+                break
+        if example is None:
+            example = root / ".env.example"
+
     if env_path.exists():
         print(f"{env_path} already exists.")
-    elif example.is_file():
+    elif example is not None and example.is_file() and example.name.startswith(".env.example."):
         shutil.copyfile(example, env_path)
-        print(f"Created {env_path}. Set SMTP_PASSWORD and PHYSICAL_ADDRESS.")
+        print(f"Created {env_path} from {example.name}. Set SMTP_PASSWORD and PHYSICAL_ADDRESS.")
+    elif example is not None and example.is_file():
+        print(
+            "Choose a provider example first:\n"
+            "  python -m mailbot init --provider ionos\n"
+            "  python -m mailbot init --provider privateemail",
+            file=sys.stderr,
+        )
+        return 1
     else:
-        print(f"Missing {example}.", file=sys.stderr)
+        print(
+            "Missing provider example. Expected .env.example.ionos or .env.example.privateemail.",
+            file=sys.stderr,
+        )
         return 1
     settings = load_settings(root)
     with Store(settings.database_path):

@@ -41,6 +41,7 @@ from mailbot.webapp import (
     parse_recipient_upload,
     parse_recipients,
     send_compose,
+    wait_idle,
 )
 from http.server import ThreadingHTTPServer
 
@@ -383,7 +384,10 @@ class CliTests(EnvMixin):
                 "SMTP_PASSWORD=\nPHYSICAL_ADDRESS=1 Main St\nHOURLY_LIMIT=15\n",
                 encoding="utf-8",
             )
-            (root / ".env.example").write_text("SMTP_PASSWORD=\n", encoding="utf-8")
+            (root / ".env.example.privateemail").write_text(
+                "SMTP_PASSWORD=\nPHYSICAL_ADDRESS=1 Main St\nHOURLY_LIMIT=15\n",
+                encoding="utf-8",
+            )
             csv_path = root / "people.csv"
             csv_path.write_text("email,name\nada@example.com,Ada Lovelace\n", encoding="utf-8")
             html_path = root / "note.html"
@@ -426,12 +430,24 @@ class WebComposeTests(EnvMixin):
         with self.assertRaises(AppError):
             parse_recipients("not-an-email")
 
-    def test_hiring_templates_render_html(self) -> None:
+    def test_parse_recipients_allows_lists_over_fifty(self) -> None:
+        raw = "\n".join(f"person{i}@example.com" for i in range(60))
+        people = parse_recipients(raw)
+        self.assertEqual(len(people), 60)
+
+    def test_hiring_templates_render_html_and_plain_text(self) -> None:
         templates = list_templates()
         self.assertEqual(len(templates), 10)
+        self.assertEqual(templates[0]["text_path"], "templates/hiring/hiring.txt")
         with tempfile.TemporaryDirectory() as folder:
             written = write_template_files(Path(folder))
-            self.assertEqual(len(written), 11)
+            self.assertEqual(len(written), 12)
+            text_path = Path(folder) / "templates" / "hiring" / "hiring.txt"
+            self.assertTrue(text_path.is_file())
+            plain_file = text_path.read_text(encoding="utf-8")
+            self.assertIn("Apply Now:", plain_file)
+            self.assertIn("https://forms.gle/d5ifR5Htk7jwRxmC9", plain_file)
+            self.assertNotIn("<h1", plain_file)
         sample = get_template("horizon")
         assert sample is not None
         self.assertEqual(sample["subject"], SUBJECT)
@@ -442,6 +458,10 @@ class WebComposeTests(EnvMixin):
         self.assertIn("/static/hirelens-logo.png", sample["html"])
         self.assertIn('alt="HireLens"', sample["html"])
         self.assertNotIn("&lt;h1", sample["html"])
+        self.assertIn("Account Executive Manager", sample["text"])
+        self.assertIn("Position Details", sample["text"])
+        self.assertIn("Apply Now: https://forms.gle/d5ifR5Htk7jwRxmC9", sample["text"])
+        self.assertNotIn("<", sample["text"])
 
     def test_upload_csv_and_json_recipient_lists(self) -> None:
         csv_result = parse_recipient_upload(
@@ -634,6 +654,48 @@ class WebComposeTests(EnvMixin):
                     "done",
                 ],
             )
+
+    def test_stop_halts_after_current_email(self) -> None:
+        self.assertTrue(wait_idle(1, lambda _seconds: None, should_stop=lambda: True))
+        with tempfile.TemporaryDirectory() as folder:
+            loaded = settings(Path(folder))
+            sent: list[str] = []
+
+            class FakeMailer:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def send(self, message, recipient: str) -> None:
+                    sent.append(recipient)
+
+            import mailbot.webapp as webapp
+
+            original = webapp.SmtpMailer
+            webapp.SmtpMailer = lambda settings: FakeMailer()
+            stop_after_first = {"armed": False}
+
+            def should_stop() -> bool:
+                return stop_after_first["armed"] and len(sent) >= 1
+
+            try:
+                report = send_compose(
+                    loaded,
+                    recipients=[("a@example.com", ""), ("b@example.com", ""), ("c@example.com", "")],
+                    subject="Hi",
+                    body="Body",
+                    idle_seconds=5,
+                    sleep=lambda _seconds: stop_after_first.update(armed=True),
+                    should_stop=should_stop,
+                )
+            finally:
+                webapp.SmtpMailer = original
+            self.assertTrue(report["stopped"])
+            self.assertEqual(report["sent"], 1)
+            self.assertEqual(sent, ["a@example.com"])
+            self.assertIn("Stopped", report["error"])
 
     def test_random_style_picks_html_per_recipient(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

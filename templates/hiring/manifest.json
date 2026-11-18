@@ -1,76 +1,97 @@
 {
   "subject": "Account Executive Manager \u2014 Part-Time Opportunity at HireLens",
   "apply_url": "https://forms.gle/d5ifR5Htk7jwRxmC9",
+  "text_path": "templates/hiring/hiring.txt",
   "templates": [
     {
       "id": "horizon",
       "name": "Horizon",
       "blurb": "Teal brand band with a clear hiring layout",
       "subject": "Account Executive Manager \u2014 Part-Time Opportunity at HireLens",
-      "path": "templates/hiring/horizon.html"
+      "path": "templates/hiring/horizon.html",
+      "text_path": "templates/hiring/hiring.txt",
+      "body_format": "html"
     },
     {
       "id": "night-shift",
       "name": "Night Shift",
       "blurb": "Dark navy canvas with a bright lime CTA",
       "subject": "Account Executive Manager \u2014 Part-Time Opportunity at HireLens",
-      "path": "templates/hiring/night-shift.html"
+      "path": "templates/hiring/night-shift.html",
+      "text_path": "templates/hiring/hiring.txt",
+      "body_format": "html"
     },
     {
       "id": "signal",
       "name": "Signal",
       "blurb": "Cool slate frame with a vivid coral accent",
       "subject": "Account Executive Manager \u2014 Part-Time Opportunity at HireLens",
-      "path": "templates/hiring/signal.html"
+      "path": "templates/hiring/signal.html",
+      "text_path": "templates/hiring/hiring.txt",
+      "body_format": "html"
     },
     {
       "id": "grove",
       "name": "Grove",
       "blurb": "Forest green hiring letter on soft mint",
       "subject": "Account Executive Manager \u2014 Part-Time Opportunity at HireLens",
-      "path": "templates/hiring/grove.html"
+      "path": "templates/hiring/grove.html",
+      "text_path": "templates/hiring/hiring.txt",
+      "body_format": "html"
     },
     {
       "id": "blueprint",
       "name": "Blueprint",
       "blurb": "High-contrast black, white, and cyan blocks",
       "subject": "Account Executive Manager \u2014 Part-Time Opportunity at HireLens",
-      "path": "templates/hiring/blueprint.html"
+      "path": "templates/hiring/blueprint.html",
+      "text_path": "templates/hiring/hiring.txt",
+      "body_format": "html"
     },
     {
       "id": "clear-day",
       "name": "Clear Day",
       "blurb": "Airy sky-blue letter with soft depth",
       "subject": "Account Executive Manager \u2014 Part-Time Opportunity at HireLens",
-      "path": "templates/hiring/clear-day.html"
+      "path": "templates/hiring/clear-day.html",
+      "text_path": "templates/hiring/hiring.txt",
+      "body_format": "html"
     },
     {
       "id": "atelier",
       "name": "Atelier",
       "blurb": "Deep burgundy and gold for a polished invite",
       "subject": "Account Executive Manager \u2014 Part-Time Opportunity at HireLens",
-      "path": "templates/hiring/atelier.html"
+      "path": "templates/hiring/atelier.html",
+      "text_path": "templates/hiring/hiring.txt",
+      "body_format": "html"
     },
     {
       "id": "beacon",
       "name": "Beacon",
       "blurb": "Charcoal body with amber highlights",
       "subject": "Account Executive Manager \u2014 Part-Time Opportunity at HireLens",
-      "path": "templates/hiring/beacon.html"
+      "path": "templates/hiring/beacon.html",
+      "text_path": "templates/hiring/hiring.txt",
+      "body_format": "html"
     },
     {
       "id": "split-focus",
       "name": "Split Focus",
       "blurb": "Two-tone teal and ink split header",
       "subject": "Account Executive Manager \u2014 Part-Time Opportunity at HireLens",
-      "path": "templates/hiring/split-focus.html"
+      "path": "templates/hiring/split-focus.html",
+      "text_path": "templates/hiring/hiring.txt",
+      "body_format": "html"
     },
     {
       "id": "lattice",
       "name": "Lattice",
       "blurb": "Minimal Swiss-inspired ice-blue composition",
       "subject": "Account Executive Manager \u2014 Part-Time Opportunity at HireLens",
-      "path": "templates/hiring/lattice.html"
+      "path": "templates/hiring/lattice.html",
+      "text_path": "templates/hiring/hiring.txt",
+      "body_format": "html"
     }
   ]
 }

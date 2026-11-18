@@ -1,4 +1,4 @@
-"""Built-in HireLens hiring email HTML templates."""
+"""Built-in HireLens hiring email HTML and plain-text templates."""
 
 from __future__ import annotations
 
@@ -307,6 +307,53 @@ def _responsibilities(theme: dict[str, str]) -> str:
     )
 
 
+def render_plain_template(*, apply_url: str | None = None) -> str:
+    """Build the shared plain-text hiring email. Themes only change HTML styling."""
+    cta_url = resolve_apply_url(apply_url)
+    details = "\n".join(f"- {label}: {value}" for label, value in COPY["details"])
+    responsibilities = "\n".join(f"- {item}" for item in COPY["responsibilities"])
+    return (
+        f"{COPY['eyebrow']}\n"
+        f"{COPY['title']}\n"
+        f"{SUBJECT}\n"
+        "\n"
+        f"{COPY['lede']}\n"
+        "\n"
+        f"{COPY['intro']}\n"
+        "\n"
+        "Part-Time · 10 hrs/week · Flexible\n"
+        "\n"
+        f"{COPY['details_heading']}\n"
+        f"{details}\n"
+        "\n"
+        f"{COPY['team_heading']}\n"
+        f"{COPY['team_p1']}\n"
+        "\n"
+        f"{COPY['team_p2']}\n"
+        "\n"
+        f"{COPY['responsibilities_heading']}\n"
+        f"{responsibilities}\n"
+        "\n"
+        f"{COPY['values']}\n"
+        "\n"
+        f"{COPY['who_heading']}\n"
+        f"{COPY['who_p1']}\n"
+        "\n"
+        f"{COPY['who_p2']}\n"
+        "\n"
+        f"{COPY['apply_heading']}\n"
+        f"{COPY['apply_p1']}\n"
+        "\n"
+        f"{COPY['apply_p2']}\n"
+        "\n"
+        f"{COPY['closing']}\n"
+        "\n"
+        f"{COPY['cta']}: {cta_url}\n"
+        "\n"
+        f"{COPY['footer']}\n"
+    )
+
+
 def render_template(
     theme: dict[str, str],
     *,
@@ -445,6 +492,8 @@ def list_templates() -> list[dict[str, str]]:
             "blurb": theme["blurb"],
             "subject": SUBJECT,
             "path": f"templates/hiring/{theme['id']}.html",
+            "text_path": "templates/hiring/hiring.txt",
+            "body_format": "html",
         }
         for theme in THEMES
     ]
@@ -463,8 +512,10 @@ def get_template(template_id: str, *, apply_url: str | None = None) -> dict[str,
         return None
     cta_url = resolve_apply_url(apply_url)
     html = render_template(theme, apply_url=cta_url, logo_src=LOGO_STATIC_PATH)
-    path = hiring_dir() / f"{theme['id']}.html"
-    path.write_text(html, encoding="utf-8")
+    text = render_plain_template(apply_url=cta_url)
+    folder = hiring_dir()
+    (folder / f"{theme['id']}.html").write_text(html, encoding="utf-8")
+    (folder / "hiring.txt").write_text(text, encoding="utf-8")
     return {
         "id": theme["id"],
         "name": theme["name"],
@@ -474,6 +525,8 @@ def get_template(template_id: str, *, apply_url: str | None = None) -> dict[str,
         "apply_url": cta_url,
         "logo_src": LOGO_STATIC_PATH,
         "html": html,
+        "text": text,
+        "text_path": "templates/hiring/hiring.txt",
     }
 
 
@@ -487,6 +540,7 @@ def pick_random_template(
     theme = chooser(THEMES)
     cta_url = resolve_apply_url(apply_url)
     logo_src = f"cid:{LOGO_CID}"
+    text = render_plain_template(apply_url=cta_url)
     return {
         "id": theme["id"],
         "name": theme["name"],
@@ -496,11 +550,13 @@ def pick_random_template(
         "apply_url": cta_url,
         "logo_src": logo_src,
         "html": render_template(theme, apply_url=cta_url, logo_src=logo_src),
+        "text": text,
+        "text_path": "templates/hiring/hiring.txt",
     }
 
 
 def write_template_files(root: Path | None = None, *, apply_url: str | None = None) -> list[Path]:
-    """Write all hiring HTML templates and a manifest into the project."""
+    """Write all hiring HTML templates, the shared plain-text body, and a manifest."""
     root = root or project_root()
     folder = root / "templates" / "hiring"
     folder.mkdir(parents=True, exist_ok=True)
@@ -513,9 +569,13 @@ def write_template_files(root: Path | None = None, *, apply_url: str | None = No
             encoding="utf-8",
         )
         written.append(path)
+    text_path = folder / "hiring.txt"
+    text_path.write_text(render_plain_template(apply_url=cta_url), encoding="utf-8")
+    written.append(text_path)
     manifest = {
         "subject": SUBJECT,
         "apply_url": cta_url,
+        "text_path": "templates/hiring/hiring.txt",
         "templates": list_templates(),
     }
     manifest_path = folder / "manifest.json"
