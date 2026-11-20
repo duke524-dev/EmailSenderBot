@@ -557,6 +557,20 @@ button:disabled {
   background: #881337;
 }
 
+.accent {
+  background: #0f766e;
+  color: #f4fffd;
+}
+
+.accent:hover {
+  background: #0d9488;
+}
+
+.resume-hint {
+  margin: 0.35rem 0 0;
+  color: var(--ink-soft);
+}
+
 .progress {
   margin-top: 0.35rem;
   padding: 1rem 1.1rem;

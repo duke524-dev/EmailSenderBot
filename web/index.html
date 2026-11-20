@@ -54,8 +54,8 @@
                 <input id="list-file" type="file" accept=".csv,.json,.txt,text/csv,application/json,text/plain" hidden>
               </label>
             </div>
-            <textarea id="to" name="to" rows="4" required placeholder="person@example.com&#10;Name &lt;another@example.com&gt;"></textarea>
-            <p class="hint">Type addresses, or upload a CSV/JSON list. CSV needs an <code>email</code> column; JSON can be an array of addresses or objects.</p>
+            <textarea id="to" name="to" rows="4" required placeholder="name@gmail.com&#10;Name &lt;name@outlook.com&gt;"></textarea>
+            <p class="hint">Only <strong>Gmail</strong> and <strong>Outlook/Hotmail/Live</strong> addresses are kept. Upload CSV/JSON or type one address per line.</p>
             <p id="upload-status" class="hint upload-status" hidden></p>
           </div>
           <label class="field field-wide">
@@ -103,9 +103,12 @@
 
       <div class="actions">
         <button type="button" id="test-login" class="ghost">Test login</button>
+        <button type="button" id="clear-resume" class="ghost" hidden>Clear resume</button>
+        <button type="button" id="resume" class="accent" hidden>Resume</button>
         <button type="button" id="stop" class="danger" hidden>Stop</button>
         <button type="submit" id="send" class="primary">Send email</button>
       </div>
+      <p id="resume-hint" class="hint resume-hint" hidden></p>
 
       <div id="progress" class="progress" hidden>
         <div class="progress-meta">
@@ -158,6 +161,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=plain1"></script>
+  <script src="/static/app.js?v=resume1"></script>
 </body>
 </html>

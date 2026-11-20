@@ -35,6 +35,7 @@ from mailbot.hiring_templates import (
     pick_random_template,
     write_template_files,
 )
+from mailbot.send_job import load_job, resumable_job
 from mailbot.webapp import (
     AppError,
     parse_idle_seconds,
@@ -112,6 +113,14 @@ class SmtpCodeTests(unittest.TestCase):
             _raise_for_code(451, "try later")
         with self.assertRaises(AuthFailed):
             _raise_for_code(535, "authentication failed")
+
+    def test_handshake_timeout_is_treated_as_temporary(self) -> None:
+        from mailbot.smtp_client import _is_transient_connect_error
+
+        self.assertTrue(_is_transient_connect_error(TimeoutError("timed out")))
+        self.assertTrue(
+            _is_transient_connect_error(OSError("_ssl.c:1064: The handshake operation timed out"))
+        )
 
 
 class PaceTests(unittest.TestCase):
@@ -419,21 +428,32 @@ class CliTests(EnvMixin):
 
 class WebComposeTests(EnvMixin):
     def test_parse_recipients_and_compose_html(self) -> None:
-        people = parse_recipients("Ada Lovelace <ada@example.com>\ngrace@example.com")
+        people = parse_recipients("Ada Lovelace <ada@gmail.com>\ngrace@outlook.com")
         self.assertEqual(
             people,
-            [("ada@example.com", "Ada Lovelace"), ("grace@example.com", "")],
+            [("ada@gmail.com", "Ada Lovelace"), ("grace@outlook.com", "")],
         )
         html = content_to_html("Hello\n\nLine two")
         self.assertIn("Hello", html)
         self.assertIn("Line two", html)
         with self.assertRaises(AppError):
             parse_recipients("not-an-email")
+        with self.assertRaises(AppError):
+            parse_recipients("ada@example.com\nbob@company.com")
 
     def test_parse_recipients_allows_lists_over_fifty(self) -> None:
-        raw = "\n".join(f"person{i}@example.com" for i in range(60))
+        raw = "\n".join(f"person{i}@gmail.com" for i in range(60))
         people = parse_recipients(raw)
         self.assertEqual(len(people), 60)
+
+    def test_parse_recipients_keeps_only_gmail_and_outlook(self) -> None:
+        people = parse_recipients(
+            "a@gmail.com\nb@company.com\nc@outlook.com\nd@hotmail.com\ne@yahoo.com"
+        )
+        self.assertEqual(
+            [email for email, _name in people],
+            ["a@gmail.com", "c@outlook.com", "d@hotmail.com"],
+        )
 
     def test_hiring_templates_render_html_and_plain_text(self) -> None:
         templates = list_templates()
@@ -466,19 +486,21 @@ class WebComposeTests(EnvMixin):
     def test_upload_csv_and_json_recipient_lists(self) -> None:
         csv_result = parse_recipient_upload(
             "people.csv",
-            "email,name\nada@example.com,Ada Lovelace\nGrace Hopper <grace@example.com>,\n",
+            "email,name\nada@gmail.com,Ada Lovelace\nGrace Hopper <grace@outlook.com>,\nskip@company.com,Skip\n",
         )
         self.assertEqual(csv_result["count"], 2)
-        self.assertIn("Ada Lovelace <ada@example.com>", csv_result["to_text"])
-        self.assertIn("grace@example.com", csv_result["to_text"])
+        self.assertEqual(csv_result["skipped"], 1)
+        self.assertIn("Ada Lovelace <ada@gmail.com>", csv_result["to_text"])
+        self.assertIn("grace@outlook.com", csv_result["to_text"])
+        self.assertNotIn("company.com", csv_result["to_text"])
 
         json_result = parse_recipient_upload(
             "people.json",
             json.dumps(
                 {
                     "recipients": [
-                        "first@example.com",
-                        {"email": "second@example.com", "name": "Second Person"},
+                        "first@gmail.com",
+                        {"email": "second@hotmail.com", "name": "Second Person"},
                     ]
                 }
             ),
@@ -486,12 +508,12 @@ class WebComposeTests(EnvMixin):
         self.assertEqual(json_result["count"], 2)
         self.assertEqual(
             json_result["to_text"],
-            "first@example.com\nSecond Person <second@example.com>",
+            "first@gmail.com\nSecond Person <second@hotmail.com>",
         )
 
         array_result = parse_recipient_upload(
             "list.json",
-            '["one@example.com", "two@example.com"]',
+            '["one@gmail.com", "two@live.com"]',
         )
         self.assertEqual(array_result["count"], 2)
 
@@ -610,11 +632,11 @@ class WebComposeTests(EnvMixin):
             sent: list[str] = []
 
             class FakeMailer:
-                def __enter__(self):
-                    return self
+                def connect(self):
+                    return None
 
-                def __exit__(self, *args):
-                    return False
+                def close(self):
+                    return None
 
                 def send(self, message, recipient: str) -> None:
                     sent.append(recipient)
@@ -627,7 +649,7 @@ class WebComposeTests(EnvMixin):
             try:
                 report = send_compose(
                     loaded,
-                    recipients=[("a@example.com", ""), ("b@example.com", ""), ("c@example.com", "")],
+                    recipients=[("a@gmail.com", ""), ("b@outlook.com", ""), ("c@hotmail.com", "")],
                     subject="Hi",
                     body="Body",
                     idle_seconds=7,
@@ -638,7 +660,7 @@ class WebComposeTests(EnvMixin):
                 webapp.SmtpMailer = original
             self.assertEqual(report["sent"], 3)
             self.assertEqual(waits, [7, 7])
-            self.assertEqual(sent, ["a@example.com", "b@example.com", "c@example.com"])
+            self.assertEqual(sent, ["a@gmail.com", "b@outlook.com", "c@hotmail.com"])
             self.assertEqual(
                 events,
                 [
@@ -655,6 +677,115 @@ class WebComposeTests(EnvMixin):
                 ],
             )
 
+    def test_resume_job_starts_from_crashed_email(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            loaded = settings(root)
+            job_path = root / "send_job.json"
+            sent: list[str] = []
+
+            crash = {"armed": True}
+
+            class CrashOnSecond:
+                def connect(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def send(self, message, recipient: str) -> None:
+                    if recipient == "b@outlook.com" and crash["armed"]:
+                        raise TemporaryFailure("451 local error in processing")
+                    sent.append(recipient)
+
+            import mailbot.webapp as webapp
+
+            original = webapp.SmtpMailer
+            webapp.SmtpMailer = lambda settings: CrashOnSecond()
+            try:
+                first = send_compose(
+                    loaded,
+                    recipients=[("a@gmail.com", ""), ("b@outlook.com", ""), ("c@hotmail.com", "")],
+                    subject="Hi",
+                    body="Body",
+                    idle_seconds=0,
+                    sleep=lambda _seconds: None,
+                    job_path=job_path,
+                )
+                self.assertFalse(first["ok"])
+                self.assertEqual(first["resume_email"], "b@outlook.com")
+                paused = resumable_job(job_path)
+                assert paused is not None
+                self.assertEqual(paused["resume_email"], "b@outlook.com")
+                self.assertEqual(paused["remaining"], 2)
+                disk = load_job(job_path)
+                assert disk is not None
+                remaining = [
+                    (item["email"], item.get("name", ""))
+                    for item in disk["recipients"][disk["next_index"] :]
+                ]
+                crash["armed"] = False
+                second = send_compose(
+                    loaded,
+                    recipients=remaining,
+                    subject="Hi",
+                    body="Body",
+                    idle_seconds=0,
+                    sleep=lambda _seconds: None,
+                    job_path=job_path,
+                    resume_offset=int(disk["next_index"]),
+                    replace_job=False,
+                )
+            finally:
+                webapp.SmtpMailer = original
+            self.assertEqual(second["sent"], 2)
+            self.assertEqual(sent, ["a@gmail.com", "b@outlook.com", "c@hotmail.com"])
+            self.assertIsNone(resumable_job(job_path))
+
+    def test_temporary_451_retries_then_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            loaded = settings(Path(folder))
+            sent: list[str] = []
+            attempts = {"n": 0}
+            waits: list[float] = []
+
+            class FlakyMailer:
+                def connect(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def send(self, message, recipient: str) -> None:
+                    if recipient == "b@outlook.com":
+                        attempts["n"] += 1
+                        if attempts["n"] < 3:
+                            raise TemporaryFailure(
+                                "451 Requested action aborted: local error in processing"
+                            )
+                    sent.append(recipient)
+
+            import mailbot.webapp as webapp
+
+            original = webapp.SmtpMailer
+            webapp.SmtpMailer = lambda settings: FlakyMailer()
+            try:
+                report = send_compose(
+                    loaded,
+                    recipients=[("a@gmail.com", ""), ("b@outlook.com", ""), ("c@hotmail.com", "")],
+                    subject="Hi",
+                    body="Body",
+                    idle_seconds=0,
+                    sleep=waits.append,
+                )
+            finally:
+                webapp.SmtpMailer = original
+            self.assertEqual(report["sent"], 3)
+            self.assertFalse(report.get("stopped"))
+            self.assertEqual(sent, ["a@gmail.com", "b@outlook.com", "c@hotmail.com"])
+            self.assertEqual(attempts["n"], 3)
+            self.assertEqual(waits, [30, 60])
+
     def test_stop_halts_after_current_email(self) -> None:
         self.assertTrue(wait_idle(1, lambda _seconds: None, should_stop=lambda: True))
         with tempfile.TemporaryDirectory() as folder:
@@ -662,11 +793,11 @@ class WebComposeTests(EnvMixin):
             sent: list[str] = []
 
             class FakeMailer:
-                def __enter__(self):
-                    return self
+                def connect(self):
+                    return None
 
-                def __exit__(self, *args):
-                    return False
+                def close(self):
+                    return None
 
                 def send(self, message, recipient: str) -> None:
                     sent.append(recipient)
@@ -683,7 +814,7 @@ class WebComposeTests(EnvMixin):
             try:
                 report = send_compose(
                     loaded,
-                    recipients=[("a@example.com", ""), ("b@example.com", ""), ("c@example.com", "")],
+                    recipients=[("a@gmail.com", ""), ("b@outlook.com", ""), ("c@hotmail.com", "")],
                     subject="Hi",
                     body="Body",
                     idle_seconds=5,
@@ -694,8 +825,9 @@ class WebComposeTests(EnvMixin):
                 webapp.SmtpMailer = original
             self.assertTrue(report["stopped"])
             self.assertEqual(report["sent"], 1)
-            self.assertEqual(sent, ["a@example.com"])
+            self.assertEqual(sent, ["a@gmail.com"])
             self.assertIn("Stopped", report["error"])
+            self.assertEqual(report["resume_email"], "b@outlook.com")
 
     def test_random_style_picks_html_per_recipient(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -704,11 +836,11 @@ class WebComposeTests(EnvMixin):
             style_events: list[str] = []
 
             class FakeMailer:
-                def __enter__(self):
-                    return self
+                def connect(self):
+                    return None
 
-                def __exit__(self, *args):
-                    return False
+                def close(self):
+                    return None
 
                 def send(self, message, recipient: str) -> None:
                     html = message.get_body(preferencelist=("html",))
@@ -722,7 +854,7 @@ class WebComposeTests(EnvMixin):
             try:
                 report = send_compose(
                     loaded,
-                    recipients=[("a@example.com", ""), ("b@example.com", ""), ("c@example.com", "")],
+                    recipients=[("a@gmail.com", ""), ("b@outlook.com", ""), ("c@hotmail.com", "")],
                     subject="",
                     body="",
                     random_style=True,

@@ -2,6 +2,9 @@ const form = document.getElementById("compose");
 const statusEl = document.getElementById("status");
 const sendBtn = document.getElementById("send");
 const stopBtn = document.getElementById("stop");
+const resumeBtn = document.getElementById("resume");
+const clearResumeBtn = document.getElementById("clear-resume");
+const resumeHint = document.getElementById("resume-hint");
 const testBtn = document.getElementById("test-login");
 const progressEl = document.getElementById("progress");
 const progressFill = document.getElementById("progress-fill");
@@ -28,6 +31,7 @@ const loadTemplateBtn = document.getElementById("load-template");
 let idleTimer = null;
 let sendAbort = null;
 let lastSendProgress = { sent: 0, failed: 0, planned: 0 };
+let resumeState = null;
 const clientLogs = [];
 let selectedTemplateId = "";
 let selectedTemplateName = "";
@@ -653,36 +657,89 @@ function setSendingUi(isSending) {
   testBtn.disabled = isSending;
   stopBtn.hidden = !isSending;
   stopBtn.disabled = !isSending;
+  if (isSending) {
+    resumeBtn.hidden = true;
+    clearResumeBtn.hidden = true;
+  } else {
+    syncResumeUi();
+  }
 }
 
-stopBtn.addEventListener("click", () => {
-  if (!sendAbort) {
+function syncResumeUi() {
+  const canResume = Boolean(resumeState && resumeState.resumable);
+  resumeBtn.hidden = !canResume;
+  clearResumeBtn.hidden = !canResume;
+  if (!canResume) {
+    resumeHint.hidden = true;
+    resumeHint.textContent = "";
     return;
   }
-  stopBtn.disabled = true;
-  clearIdleTimer();
-  setStatus("Stopping…");
-  progressLabel.textContent = "Stopping after the current email…";
-  pushLog("Stop requested. Finishing the current email, then ending the run.");
-  sendAbort.abort();
-});
+  resumeHint.hidden = false;
+  resumeHint.textContent =
+    `Paused at ${resumeState.resume_email || "next address"}. ` +
+    `${resumeState.remaining} remaining of ${resumeState.planned}. Click Resume to continue.`;
+}
 
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
+async function refreshResumeState() {
+  try {
+    const response = await fetch("/api/resume");
+    const data = await response.json();
+    resumeState = data && data.resumable ? data : null;
+  } catch (_error) {
+    resumeState = null;
+  }
+  syncResumeUi();
+}
+
+function applyResumeToForm(job) {
+  if (!job) {
+    return;
+  }
+  if (job.to_text) {
+    toInput.value = job.to_text;
+  }
+  if (job.subject) {
+    subjectInput.value = job.subject;
+  }
+  if (typeof job.body === "string") {
+    bodyInput.value = job.body;
+  }
+  if (job.body_format) {
+    setBodyFormat(job.body_format === "html" ? "html" : job.body_format === "plain" ? "plain" : "auto");
+  }
+  const randomToggle = document.getElementById("random_style");
+  if (randomToggle) {
+    randomToggle.checked = Boolean(job.random_style);
+    syncBodyFormatUi();
+  }
+  if (typeof job.idle_seconds === "number") {
+    document.getElementById("idle_seconds").value = String(job.idle_seconds);
+  }
+}
+
+async function runSend({ resume = false } = {}) {
   clearIdleTimer();
   if (sendAbort) {
     sendAbort.abort();
   }
   sendAbort = new AbortController();
   lastSendProgress = { sent: 0, failed: 0, planned: 0 };
-  setStatus("Sending…");
+  setStatus(resume ? "Resuming…" : "Sending…");
   showProgress();
-  updateProgress({ done: 0, planned: 0, label: "Connecting…", state: "" });
+  updateProgress({
+    done: 0,
+    planned: 0,
+    label: resume ? "Resuming from paused email…" : "Connecting…",
+    state: "",
+  });
   setSendingUi(true);
   try {
     const data = payload();
     if (Number.isNaN(data.idle_seconds) || data.idle_seconds < 0) {
       throw new Error("Idle time must be 0 or more seconds.");
+    }
+    if (resume) {
+      data.resume = true;
     }
     const result = await postSendStream(
       data,
@@ -739,7 +796,7 @@ form.addEventListener("submit", async (event) => {
             done: event.sent + event.failed,
             planned: event.planned,
             label: event.message || "Done",
-            state: event.stopped ? "is-done" : event.failed ? "is-error" : "is-done",
+            state: event.stopped || event.resumable ? "is-done" : event.failed ? "is-error" : "is-done",
           });
         }
         if (event.type === "error") {
@@ -757,8 +814,11 @@ form.addEventListener("submit", async (event) => {
     );
 
     const lines = [];
-    if (result.stopped) {
-      lines.push(result.message || `Stopped. Sent ${result.sent} of ${result.planned}.`);
+    if (result.stopped || result.resumable) {
+      lines.push(result.message || `Paused. Sent ${result.sent} of ${result.planned}.`);
+      if (result.resume_email) {
+        lines.push(`Resume from ${result.resume_email}.`);
+      }
     } else {
       lines.push(`Sent ${result.sent} of ${result.planned}.`);
     }
@@ -774,7 +834,10 @@ form.addEventListener("submit", async (event) => {
     if (result.errors && result.errors.length) {
       lines.push(...result.errors.slice(0, 8));
     }
-    setStatus(lines.join("\n"), result.failed && !result.stopped ? "is-error" : "is-ok");
+    setStatus(
+      lines.join("\n"),
+      result.failed && !result.stopped && !result.resumable ? "is-error" : "is-ok"
+    );
   } catch (error) {
     clearIdleTimer();
     if (error && error.stopped) {
@@ -793,6 +856,45 @@ form.addEventListener("submit", async (event) => {
   } finally {
     sendAbort = null;
     setSendingUi(false);
+    await refreshResumeState();
+  }
+}
+
+stopBtn.addEventListener("click", () => {
+  if (!sendAbort) {
+    return;
+  }
+  stopBtn.disabled = true;
+  clearIdleTimer();
+  setStatus("Stopping…");
+  progressLabel.textContent = "Stopping after the current email…";
+  pushLog("Stop requested. Finishing the current email, then ending the run.");
+  sendAbort.abort();
+});
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await runSend({ resume: false });
+});
+
+resumeBtn.addEventListener("click", async () => {
+  if (!resumeState || !resumeState.resumable) {
+    setStatus("No paused send to resume.", "is-error");
+    return;
+  }
+  applyResumeToForm(resumeState);
+  pushLog(`Resuming from ${resumeState.resume_email || "paused address"}.`);
+  await runSend({ resume: true });
+});
+
+clearResumeBtn.addEventListener("click", async () => {
+  try {
+    await postJson("/api/clear-resume", {});
+    resumeState = null;
+    syncResumeUi();
+    setStatus("Resume state cleared.", "is-ok");
+  } catch (error) {
+    setStatus(error.message || String(error), "is-error");
   }
 });
 
@@ -913,3 +1015,4 @@ document.getElementById("random_style").addEventListener("change", () => {
 syncBodyFormatUi();
 loadDefaults();
 loadTemplates();
+refreshResumeState();

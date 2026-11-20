@@ -29,6 +29,17 @@ from mailbot.hiring_templates import (
     write_template_files,
 )
 from mailbot.message import build_compose_message, resolve_body_format
+from mailbot.send_job import (
+    clear_job,
+    job_path_for,
+    load_job,
+    mark_done,
+    mark_paused,
+    mark_sent,
+    recipients_from_job,
+    resumable_job,
+    start_job,
+)
 from mailbot.smtp_client import AuthFailed, MailerError, RecipientRejected, SmtpMailer, TemporaryFailure
 from mailbot.store import Store, normalize_email, normalize_header, valid_email
 
@@ -38,8 +49,47 @@ RECIPIENT_RE = re.compile(r"^(?:([^<>]*?)\s*)?(?:<([^>]+)>|([^\s,;]+))$")
 MAX_BODY = 2_000_000
 MAX_IDLE_SECONDS = 3600
 LOG_LIMIT = 200
+# Retry temporary SMTP codes (421/450/451/…) before stopping a bulk run.
+TEMPORARY_RETRY_WAITS = (0, 30, 60)
+GMAIL_DOMAINS = frozenset({"gmail.com", "googlemail.com"})
+OUTLOOK_DOMAINS = frozenset(
+    {
+        "outlook.com",
+        "outlook.co.uk",
+        "outlook.fr",
+        "outlook.de",
+        "outlook.es",
+        "outlook.it",
+        "outlook.ca",
+        "hotmail.com",
+        "hotmail.co.uk",
+        "hotmail.fr",
+        "hotmail.de",
+        "hotmail.es",
+        "hotmail.it",
+        "hotmail.ca",
+        "live.com",
+        "live.co.uk",
+        "msn.com",
+    }
+)
 _LOG_LOCK = threading.Lock()
 _LOG_LINES: deque[str] = deque(maxlen=LOG_LIMIT)
+
+
+def is_gmail_or_outlook(email: str) -> bool:
+    address = normalize_email(email)
+    if "@" not in address:
+        return False
+    domain = address.rsplit("@", 1)[-1]
+    return domain in GMAIL_DOMAINS or domain in OUTLOOK_DOMAINS
+
+
+def filter_gmail_outlook(
+    people: list[tuple[str, str]],
+) -> tuple[list[tuple[str, str]], int]:
+    kept = [(email, name) for email, name in people if is_gmail_or_outlook(email)]
+    return kept, len(people) - len(kept)
 
 
 def append_log(message: str) -> None:
@@ -118,6 +168,52 @@ def wait_idle(
     return should_stop()
 
 
+def deliver_with_retry(
+    mailer,
+    message,
+    recipient: str,
+    *,
+    sleep: Callable[[float], None],
+    emit: Callable[[dict], None],
+    should_stop: Callable[[], bool] | None = None,
+    waits: tuple[int, ...] = TEMPORARY_RETRY_WAITS,
+) -> None:
+    """Send one message. Retry temporary SMTP failures a few times, then raise."""
+    last: TemporaryFailure | None = None
+    for attempt, pause in enumerate(waits):
+        if should_stop and should_stop():
+            raise TemporaryFailure("Stopped before retry completed.")
+        if pause:
+            emit(
+                {
+                    "type": "waiting",
+                    "email": recipient,
+                    "idle_seconds": pause,
+                    "message": (
+                        f"Temporary mail error for {recipient}. "
+                        f"Retry {attempt}/{len(waits) - 1} in {pause}s."
+                    ),
+                }
+            )
+            if wait_idle(pause, sleep, should_stop):
+                raise TemporaryFailure("Stopped during temporary-error retry.")
+        try:
+            mailer.send(message, recipient)
+            return
+        except TemporaryFailure as exc:
+            last = exc
+            emit(
+                {
+                    "type": "failed",
+                    "email": recipient,
+                    "error": str(exc),
+                    "message": f"Temporary mail error for {recipient}: {exc}",
+                }
+            )
+    assert last is not None
+    raise last
+
+
 def format_recipient_line(email: str, name: str = "") -> str:
     address = normalize_email(email)
     display = (name or "").strip()
@@ -141,7 +237,7 @@ def merge_recipients(
     return merged
 
 
-def parse_recipients(raw: str) -> list[tuple[str, str]]:
+def parse_recipients(raw: str, *, require_gmail_outlook: bool = True) -> list[tuple[str, str]]:
     people: list[tuple[str, str]] = []
     seen: set[str] = set()
     for chunk in re.split(r"[\n,;]+", raw or ""):
@@ -161,6 +257,14 @@ def parse_recipients(raw: str) -> list[tuple[str, str]]:
         people.append((address, name))
     if not people:
         raise AppError("Add at least one recipient in the To field.")
+    if require_gmail_outlook:
+        kept, skipped = filter_gmail_outlook(people)
+        if not kept:
+            raise AppError(
+                "No Gmail or Outlook addresses found. Only gmail.com / googlemail.com "
+                "and Outlook/Hotmail/Live/MSN addresses are sent."
+            )
+        return kept
     return people
 
 
@@ -233,7 +337,11 @@ def parse_recipients_csv(content: str) -> list[tuple[str, str]]:
     return people
 
 
-def parse_recipients_lines(content: str) -> list[tuple[str, str]]:
+def parse_recipients_lines(
+    content: str,
+    *,
+    require_gmail_outlook: bool = True,
+) -> list[tuple[str, str]]:
     """Parse a simple one-address-per-line file, with or without a header."""
     lines = [line.strip() for line in content.replace("\r\n", "\n").split("\n")]
     lines = [line for line in lines if line]
@@ -241,7 +349,7 @@ def parse_recipients_lines(content: str) -> list[tuple[str, str]]:
         raise AppError("File is empty.")
     if normalize_header(lines[0]) in {"email", "mail", "address", "recipient", "e_mail", "email_address"}:
         lines = lines[1:]
-    return parse_recipients("\n".join(lines))
+    return parse_recipients("\n".join(lines), require_gmail_outlook=require_gmail_outlook)
 
 
 def parse_recipients_json(content: str) -> list[tuple[str, str]]:
@@ -300,33 +408,45 @@ def parse_recipient_upload(filename: str, content: str) -> dict:
     if name.endswith(".json"):
         people = parse_recipients_json(content)
         source = "json"
-    elif name.endswith(".csv") or name.endswith(".txt"):
-        if name.endswith(".txt"):
-            people = parse_recipients_lines(content)
-        else:
-            try:
-                people = parse_recipients_csv(content)
-            except AppError:
-                # Some CSVs are really just email lists without a usable header.
-                people = parse_recipients_lines(content)
-        source = "csv" if name.endswith(".csv") else "txt"
+    elif name.endswith(".txt"):
+        people = parse_recipients_lines(content, require_gmail_outlook=False)
+        source = "txt"
+    elif name.endswith(".csv"):
+        try:
+            people = parse_recipients_csv(content)
+        except AppError:
+            people = parse_recipients_lines(content, require_gmail_outlook=False)
+        source = "csv"
     else:
         stripped = content.lstrip()
         if stripped.startswith("[") or stripped.startswith("{"):
             people = parse_recipients_json(content)
             source = "json"
         else:
-            people = parse_recipients_csv(content)
+            try:
+                people = parse_recipients_csv(content)
+            except AppError:
+                people = parse_recipients_lines(content, require_gmail_outlook=False)
             source = "csv"
 
-    lines = [format_recipient_line(email, display) for email, display in people]
+    kept, skipped = filter_gmail_outlook(people)
+    if not kept:
+        raise AppError(
+            "No Gmail or Outlook addresses found in the file. "
+            "Only gmail.com / googlemail.com and Outlook/Hotmail/Live/MSN addresses are kept."
+        )
+    lines = [format_recipient_line(email, display) for email, display in kept]
+    message = f"Loaded {len(kept)} Gmail/Outlook address(es) from {source.upper()}."
+    if skipped:
+        message += f" Skipped {skipped} other domain(s)."
     return {
         "ok": True,
         "source": source,
-        "count": len(people),
-        "recipients": [{"email": email, "name": display} for email, display in people],
+        "count": len(kept),
+        "skipped": skipped,
+        "recipients": [{"email": email, "name": display} for email, display in kept],
         "to_text": "\n".join(lines),
-        "message": f"Loaded {len(people)} address(es) from {source.upper()}.",
+        "message": message,
     }
 
 
@@ -363,6 +483,9 @@ def send_compose(
     log: Callable[[str], None] | None = None,
     on_progress: Callable[[dict], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    job_path: Path | None = None,
+    resume_offset: int = 0,
+    replace_job: bool = True,
     rng=None,
 ) -> dict:
     subject = subject.strip()
@@ -380,6 +503,12 @@ def send_compose(
     if not random_style and not body:
         raise AppError("Email content is required.")
     idle_seconds = parse_idle_seconds(idle_seconds)
+    recipients, skipped_domains = filter_gmail_outlook(recipients)
+    if not recipients:
+        raise AppError(
+            "No Gmail or Outlook addresses to send. "
+            "Only gmail.com / googlemail.com and Outlook/Hotmail/Live/MSN addresses are sent."
+        )
 
     report = {
         "ok": True,
@@ -392,7 +521,19 @@ def send_compose(
         "random_style": random_style,
         "styles_used": [],
         "stopped": False,
+        "skipped_domains": skipped_domains,
+        "resume_email": "",
     }
+    if job_path is not None and replace_job:
+        start_job(
+            job_path,
+            recipients=recipients,
+            subject=subject,
+            body=body,
+            body_format=body_format,
+            random_style=random_style,
+            idle_seconds=idle_seconds,
+        )
 
     def emit(event: dict) -> None:
         if on_progress is not None:
@@ -403,16 +544,28 @@ def send_compose(
     def stop_requested() -> bool:
         return bool(should_stop and should_stop())
 
-    def finish_stopped(reason: str) -> dict:
+    def finish_stopped(reason: str, *, resume_email: str = "", next_index: int | None = None) -> dict:
         report["stopped"] = True
         report["ok"] = True
         report["error"] = reason
+        report["resume_email"] = resume_email
+        if job_path is not None:
+            index = resume_offset + (next_index if next_index is not None else report["sent"] + report["failed"])
+            mark_paused(
+                job_path,
+                next_index=index,
+                resume_email=resume_email,
+                sent=report["sent"],
+                failed=report["failed"],
+                error=reason,
+            )
         emit(
             {
                 "type": "done",
                 **report,
                 "done": report["sent"] + report["failed"],
                 "message": reason,
+                "resumable": True,
             }
         )
         return report
@@ -425,6 +578,7 @@ def send_compose(
             if requested_format == body_format
             else f"Content looks like HTML; sending as HTML (was {requested_format})."
         )
+    skip_note = f" Skipped {skipped_domains} non-Gmail/Outlook address(es)." if skipped_domains else ""
     emit(
         {
             "type": "start",
@@ -435,17 +589,96 @@ def send_compose(
             "done": 0,
             "sent": 0,
             "failed": 0,
-            "message": f"Starting send to {report['planned']} recipient(s). {format_note}",
+            "message": f"Starting send to {report['planned']} Gmail/Outlook recipient(s). {format_note}{skip_note}",
         }
     )
+    first_email = recipients[0][0] if recipients else ""
     if stop_requested():
-        return finish_stopped("Stopped before any email was sent.")
-    with SmtpMailer(settings) as mailer:
+        return finish_stopped(
+            "Stopped before any email was sent.",
+            resume_email=first_email,
+            next_index=0,
+        )
+
+    mailer = None
+    connect_error: TemporaryFailure | None = None
+    for attempt, pause in enumerate(TEMPORARY_RETRY_WAITS):
+        if stop_requested():
+            return finish_stopped(
+                "Stopped before any email was sent.",
+                resume_email=first_email,
+                next_index=0,
+            )
+        if pause:
+            emit(
+                {
+                    "type": "waiting",
+                    "idle_seconds": pause,
+                    "done": 0,
+                    "sent": 0,
+                    "failed": 0,
+                    "planned": report["planned"],
+                    "message": (
+                        f"SMTP connect failed. Retry {attempt}/{len(TEMPORARY_RETRY_WAITS) - 1} "
+                        f"in {pause}s."
+                    ),
+                }
+            )
+            if wait_idle(pause, sleep, should_stop):
+                return finish_stopped(
+                    "Stopped while retrying SMTP connect.",
+                    resume_email=first_email,
+                    next_index=0,
+                )
+        try:
+            mailer = SmtpMailer(settings)
+            mailer.connect()
+            connect_error = None
+            break
+        except TemporaryFailure as exc:
+            connect_error = exc
+            emit(
+                {
+                    "type": "failed",
+                    "error": str(exc),
+                    "done": 0,
+                    "sent": 0,
+                    "failed": 0,
+                    "planned": report["planned"],
+                    "message": f"Temporary SMTP connect error: {exc}",
+                }
+            )
+            continue
+        except AuthFailed:
+            raise
+        except MailerError as exc:
+            raise AppError(str(exc), status=502) from exc
+    if mailer is None:
+        assert connect_error is not None
+        report["ok"] = False
+        report["failed"] = 0
+        report["error"] = f"Could not open SMTP after retries: {connect_error}"
+        report["resume_email"] = first_email
+        if job_path is not None:
+            mark_paused(
+                job_path,
+                next_index=resume_offset,
+                resume_email=first_email,
+                sent=report["sent"],
+                failed=report["failed"],
+                error=report["error"],
+            )
+        emit({"type": "done", **report, "message": report["error"], "resumable": True})
+        return report
+
+    try:
         for index, (address, name) in enumerate(recipients):
             position = index + 1
             if stop_requested():
                 return finish_stopped(
-                    f"Stopped. Sent {report['sent']} of {report['planned']}."
+                    f"Stopped. Sent {report['sent']} of {report['planned']}.",
+                    resume_email=address,
+                    next_index=index,
                 )
             if index > 0 and idle_seconds > 0:
                 emit(
@@ -463,11 +696,15 @@ def send_compose(
                 )
                 if wait_idle(idle_seconds, sleep, should_stop):
                     return finish_stopped(
-                        f"Stopped during idle wait. Sent {report['sent']} of {report['planned']}."
+                        f"Stopped during idle wait. Sent {report['sent']} of {report['planned']}.",
+                        resume_email=address,
+                        next_index=index,
                     )
             if stop_requested():
                 return finish_stopped(
-                    f"Stopped. Sent {report['sent']} of {report['planned']}."
+                    f"Stopped. Sent {report['sent']} of {report['planned']}.",
+                    resume_email=address,
+                    next_index=index,
                 )
             style_id = ""
             style_name = ""
@@ -506,10 +743,24 @@ def send_compose(
                 body_format=send_format,
             )
             try:
-                mailer.send(message, address)
+                deliver_with_retry(
+                    mailer,
+                    message,
+                    address,
+                    sleep=sleep,
+                    emit=emit,
+                    should_stop=should_stop,
+                )
             except RecipientRejected as exc:
                 report["failed"] += 1
                 report["errors"].append(f"{address}: {exc}")
+                if job_path is not None:
+                    mark_sent(
+                        job_path,
+                        index=resume_offset + index + 1,
+                        sent=report["sent"],
+                        failed=report["failed"],
+                    )
                 emit(
                     {
                         "type": "failed",
@@ -528,7 +779,19 @@ def send_compose(
                 report["failed"] += 1
                 report["errors"].append(f"{address}: {exc}")
                 report["ok"] = False
-                report["error"] = f"Stopped after a temporary mail error: {exc}"
+                report["error"] = (
+                    f"Stopped after temporary mail errors for {address}: {exc}"
+                )
+                report["resume_email"] = address
+                if job_path is not None:
+                    mark_paused(
+                        job_path,
+                        next_index=resume_offset + index,
+                        resume_email=address,
+                        sent=report["sent"],
+                        failed=report["failed"],
+                        error=report["error"],
+                    )
                 emit(
                     {
                         "type": "failed",
@@ -542,13 +805,36 @@ def send_compose(
                         "message": report["error"],
                     }
                 )
-                emit({"type": "done", **report, "message": report["error"]})
+                emit(
+                    {
+                        "type": "done",
+                        **report,
+                        "message": report["error"],
+                        "resumable": True,
+                    }
+                )
                 return report
             except AuthFailed as exc:
                 raise AppError(str(exc), status=401) from exc
             except MailerError as exc:
+                if job_path is not None:
+                    mark_paused(
+                        job_path,
+                        next_index=resume_offset + index,
+                        resume_email=address,
+                        sent=report["sent"],
+                        failed=report["failed"],
+                        error=str(exc),
+                    )
                 raise AppError(str(exc), status=502) from exc
             report["sent"] += 1
+            if job_path is not None:
+                mark_sent(
+                    job_path,
+                    index=resume_offset + index + 1,
+                    sent=report["sent"],
+                    failed=report["failed"],
+                )
             emit(
                 {
                     "type": "sent",
@@ -561,9 +847,13 @@ def send_compose(
                     "message": f"Sent {position}/{report['planned']} to {address}.",
                 }
             )
+    finally:
+        mailer.close()
     if report["failed"] and report["sent"] == 0:
         report["ok"] = False
         report["error"] = report["errors"][0] if report["errors"] else "Send failed."
+    if job_path is not None and report["sent"] + report["failed"] >= report["planned"]:
+        mark_done(job_path)
     summary = f"Sent {report['sent']} of {report['planned']}."
     if report["failed"]:
         summary += f" Failed {report['failed']}."
@@ -600,6 +890,13 @@ def make_handler(settings: Settings, web_root: Path):
                     return
                 if path == "/api/logs":
                     self._json(200, {"ok": True, "lines": recent_logs()})
+                    return
+                if path == "/api/resume":
+                    job = resumable_job(job_path_for(settings.database_path))
+                    if job is None:
+                        self._json(200, {"ok": True, "resumable": False})
+                        return
+                    self._json(200, {**job, "resumable": True})
                     return
                 if path == "/api/defaults":
                     self._json(
@@ -681,26 +978,73 @@ def make_handler(settings: Settings, web_root: Path):
                         from_name=str(payload.get("from_name", "")),
                         physical_address=str(payload.get("physical_address", "")),
                     )
-                    recipients = parse_recipients(str(payload.get("to", "")))
-                    idle = parse_idle_seconds(
-                        payload.get("idle_seconds"),
-                        fallback=default_idle_seconds(live),
-                    )
-                    body_format = parse_body_format(payload.get("body_format", "plain"))
-                    random_style = parse_bool(payload.get("random_style", False))
-                    append_log(
-                        f"POST /api/send to {len(recipients)} recipient(s), "
-                        f"format={body_format}, random_style={random_style}, idle={idle}s"
-                    )
+                    job_file = job_path_for(settings.database_path)
+                    resume = parse_bool(payload.get("resume", False))
+                    resume_offset = 0
+                    if resume:
+                        saved = resumable_job(job_file)
+                        disk = load_job(job_file)
+                        if saved is None or disk is None:
+                            raise AppError("No paused send to resume.")
+                        recipients = recipients_from_job(disk)
+                        if not recipients:
+                            clear_job(job_file)
+                            raise AppError("Paused send has no remaining recipients.")
+                        resume_offset = int(disk.get("next_index", 0) or 0)
+                        subject = str(disk.get("subject") or payload.get("subject", ""))
+                        body = str(disk.get("body") or payload.get("body", ""))
+                        body_format = parse_body_format(
+                            disk.get("body_format") or payload.get("body_format", "plain")
+                        )
+                        random_style = parse_bool(
+                            disk.get("random_style", payload.get("random_style", False))
+                        )
+                        idle = parse_idle_seconds(
+                            disk.get("idle_seconds", payload.get("idle_seconds")),
+                            fallback=default_idle_seconds(live),
+                        )
+                        append_log(
+                            f"POST /api/send resume from {saved.get('resume_email', '')} "
+                            f"({len(recipients)} remaining)"
+                        )
+                    else:
+                        recipients = parse_recipients(str(payload.get("to", "")))
+                        idle = parse_idle_seconds(
+                            payload.get("idle_seconds"),
+                            fallback=default_idle_seconds(live),
+                        )
+                        body_format = parse_body_format(payload.get("body_format", "plain"))
+                        random_style = parse_bool(payload.get("random_style", False))
+                        subject = str(payload.get("subject", ""))
+                        body = str(payload.get("body", ""))
+                        append_log(
+                            f"POST /api/send to {len(recipients)} recipient(s), "
+                            f"format={body_format}, random_style={random_style}, idle={idle}s"
+                        )
                     streaming = True
                     self._stream_send(
                         live,
                         recipients=recipients,
-                        subject=str(payload.get("subject", "")),
-                        body=str(payload.get("body", "")),
+                        subject=subject,
+                        body=body,
                         body_format=body_format,
                         random_style=random_style,
                         idle_seconds=idle,
+                        job_path=job_file,
+                        resume_offset=resume_offset if resume else 0,
+                        fresh_job=not resume,
+                    )
+                    return
+                if path == "/api/clear-resume":
+                    clear_job(job_path_for(settings.database_path))
+                    append_log("Cleared paused send job.")
+                    self._json(
+                        200,
+                        {
+                            "ok": True,
+                            "message": "Resume state cleared.",
+                            "logs": recent_logs(40),
+                        },
                     )
                     return
                 self._json(404, {"ok": False, "error": "Not found.", "logs": recent_logs(40)})
@@ -744,6 +1088,9 @@ def make_handler(settings: Settings, web_root: Path):
             body_format: str,
             random_style: bool = False,
             idle_seconds: int,
+            job_path: Path | None = None,
+            resume_offset: int = 0,
+            fresh_job: bool = True,
         ) -> None:
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -792,20 +1139,42 @@ def make_handler(settings: Settings, web_root: Path):
                     idle_seconds=idle_seconds,
                     on_progress=write_event,
                     should_stop=should_stop,
+                    job_path=job_path,
+                    resume_offset=resume_offset if not fresh_job else 0,
+                    replace_job=fresh_job,
                 )
             except AppError as exc:
                 append_log(f"ERROR send: {exc}")
+                if job_path is not None and recipients:
+                    mark_paused(
+                        job_path,
+                        next_index=resume_offset,
+                        resume_email=recipients[0][0],
+                        sent=0,
+                        failed=0,
+                        error=str(exc),
+                    )
                 write_event(
                     {
                         "type": "error",
                         "ok": False,
                         "error": str(exc),
                         "message": str(exc),
+                        "resumable": True,
                     }
                 )
             except Exception as exc:  # noqa: BLE001 - surface unexpected SMTP failures to the UI
                 detail = f"{exc}\n{traceback.format_exc()}"
                 append_log(f"ERROR send: {exc}")
+                if job_path is not None and recipients:
+                    mark_paused(
+                        job_path,
+                        next_index=resume_offset,
+                        resume_email=recipients[0][0],
+                        sent=0,
+                        failed=0,
+                        error=str(exc),
+                    )
                 write_event(
                     {
                         "type": "error",
@@ -813,6 +1182,7 @@ def make_handler(settings: Settings, web_root: Path):
                         "error": str(exc),
                         "detail": detail,
                         "message": str(exc),
+                        "resumable": True,
                     }
                 )
 

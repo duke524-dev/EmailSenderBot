@@ -1,14 +1,19 @@
-"""SMTP connection to Namecheap Private Email."""
+"""SMTP connection for mailbox providers such as IONOS and Private Email."""
 
 from __future__ import annotations
 
 import smtplib
+import ssl
+import time
 from email.message import EmailMessage
 
 from mailbot.config import Settings
 
 
 TEMPORARY_CODES = {421, 450, 451, 452, 454}
+CONNECT_ATTEMPTS = 2
+CONNECT_RETRY_SECONDS = (0, 20)
+SMTP_TIMEOUT_SECONDS = 45
 
 
 class MailerError(Exception):
@@ -33,6 +38,27 @@ def _text(value: object) -> str:
     return str(value)
 
 
+def _is_transient_connect_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError, ConnectionResetError, BrokenPipeError)):
+        return True
+    if isinstance(exc, ssl.SSLError):
+        return True
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "timed out",
+            "timeout",
+            "temporarily",
+            "try again",
+            "connection reset",
+            "connection refused",
+            "network is unreachable",
+            "handshake",
+        )
+    )
+
+
 class SmtpMailer:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -47,31 +73,55 @@ class SmtpMailer:
 
     def connect(self) -> None:
         settings = self.settings
-        try:
-            if settings.smtp_security == "ssl":
-                smtp: smtplib.SMTP = smtplib.SMTP_SSL(
-                    settings.smtp_host,
-                    settings.smtp_port,
-                    timeout=20,
-                )
-            else:
-                smtp = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20)
-                smtp.ehlo()
-                smtp.starttls()
-                smtp.ehlo()
-            smtp.login(settings.smtp_username, settings.smtp_password)
-        except smtplib.SMTPAuthenticationError as exc:
-            raise AuthFailed(
-                "SMTP login failed. Check SMTP_USERNAME and SMTP_PASSWORD. "
-                "In Private Email, turn on SMTP under Connect third-party apps. "
-                "If an app password exists, use that password here. "
-                f"Server said: {_text(exc.smtp_error)}"
-            ) from exc
-        except (OSError, smtplib.SMTPException) as exc:
-            raise MailerError(
-                f"Could not connect to {settings.smtp_host}:{settings.smtp_port} ({settings.smtp_security}). {exc}"
-            ) from exc
-        self._smtp = smtp
+        last_error: BaseException | None = None
+        for attempt, pause in enumerate(CONNECT_RETRY_SECONDS[:CONNECT_ATTEMPTS]):
+            if pause:
+                time.sleep(pause)
+            try:
+                self._smtp = self._open_session()
+                return
+            except smtplib.SMTPAuthenticationError as exc:
+                raise AuthFailed(
+                    "SMTP login failed. Check SMTP_USERNAME and SMTP_PASSWORD. "
+                    "Use the full mailbox address and its password (or app password). "
+                    f"Server said: {_text(exc.smtp_error)}"
+                ) from exc
+            except (OSError, ssl.SSLError, smtplib.SMTPException) as exc:
+                last_error = exc
+                if not _is_transient_connect_error(exc):
+                    break
+                if attempt + 1 < CONNECT_ATTEMPTS:
+                    continue
+        assert last_error is not None
+        detail = (
+            f"Could not connect to {settings.smtp_host}:{settings.smtp_port} "
+            f"({settings.smtp_security}). {last_error}"
+        )
+        if settings.smtp_port == 465:
+            detail += " If this keeps timing out, try SMTP_PORT=587 and SMTP_SECURITY=starttls."
+        if _is_transient_connect_error(last_error):
+            raise TemporaryFailure(detail) from last_error
+        raise MailerError(detail) from last_error
+
+    def _open_session(self) -> smtplib.SMTP:
+        settings = self.settings
+        if settings.smtp_security == "ssl":
+            smtp: smtplib.SMTP = smtplib.SMTP_SSL(
+                settings.smtp_host,
+                settings.smtp_port,
+                timeout=SMTP_TIMEOUT_SECONDS,
+            )
+        else:
+            smtp = smtplib.SMTP(
+                settings.smtp_host,
+                settings.smtp_port,
+                timeout=SMTP_TIMEOUT_SECONDS,
+            )
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+        smtp.login(settings.smtp_username, settings.smtp_password)
+        return smtp
 
     def close(self) -> None:
         smtp = self._smtp
@@ -101,10 +151,24 @@ class SmtpMailer:
             )
         except smtplib.SMTPServerDisconnected:
             if not reconnect:
-                raise MailerError("The SMTP server closed the connection.")
+                raise TemporaryFailure("The SMTP server closed the connection.")
             self._smtp = None
             self.connect()
             self._send_once(message, recipient, reconnect=False)
+        except (TimeoutError, OSError, ssl.SSLError) as exc:
+            self._smtp = None
+            if _is_transient_connect_error(exc):
+                if reconnect:
+                    try:
+                        self.connect()
+                        self._send_once(message, recipient, reconnect=False)
+                        return
+                    except TemporaryFailure:
+                        raise
+                raise TemporaryFailure(
+                    f"SMTP connection failed while sending to {recipient}: {exc}"
+                ) from exc
+            raise MailerError(f"SMTP connection failed while sending to {recipient}: {exc}") from exc
         except smtplib.SMTPRecipientsRefused as exc:
             code, detail = next(iter(exc.recipients.values()))
             _raise_for_code(int(code), _text(detail))
